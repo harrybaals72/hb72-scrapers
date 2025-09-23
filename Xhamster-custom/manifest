@@ -1,0 +1,9 @@
+id: Xhamster-custom
+name: xhamster-custom
+metadata: {}
+version: 3f1506c
+date: "2024-06-19 13:05:41"
+requires: []
+# source_repository: https://stashapp.github.io/CommunityScrapers/stable/index.yml
+files:
+- Xhamster-custom.yml
