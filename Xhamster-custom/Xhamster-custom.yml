@@ -57,6 +57,9 @@ xPathScrapers:
   sceneScraper:
     common:
       $player: //div[@class="width-wrap with-player-container"]
+      $profile: //div[@class="width-wrap with-player-container"]/nav//a[contains(@href,"/profiles/")]
+      $channel: //div[@class="width-wrap with-player-container"]/nav//a[contains(@href,"/channels/")]
+      $retiredUser: //div[contains(@data-tooltip,"User is retired")]
     scene:
       Title: $player//h1
       Details: //div[@class="ab-info controls-info__item xh-helper-hidden"]/p
@@ -77,5 +80,6 @@ xPathScrapers:
       #     selector: $player/nav//a[contains(@href,"/categories/") or contains(@href,"/tags/")]
       Performers:
         Name:
-          selector: $player/nav//a[contains(@href,"/pornstars/")]
+          # selector: $player/nav//a[contains(@href,"/pornstars/")] | $profile/div[contains(@class,"content")]/span | $retiredUser//span
+          selector: //*[@class="entity-author-container__name"]/span
 # Last Updated February 17, 2024

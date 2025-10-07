@@ -1,0 +1,9 @@
+id: Pornhub-custom
+name: Pornhub-custom
+metadata: {}
+version: f484936
+date: "2025-04-27 23:40:09"
+requires: []
+# source_repository: https://stashapp.github.io/CommunityScrapers/stable/index.yml
+files:
+- Pornhub-custom.yml
