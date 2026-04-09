@@ -17,17 +17,23 @@ sceneByFragment:
       # expects an id in square brackets before extension, as saved by yt-dlp by default
       - regex: '.*\[([0-9a-zA-Z]{4,})\]\.[^\.]{3,4}$'
         with: $1
-      # or expects an id starting with _xh
-      - regex: '(?i)^.+_(xh[^.]+)\.mp4$'
+      # or expects an id starting with _xh and followed by the quality
+      - regex: '(?i)^.+_(xh[\w\d]+)_[\d]{3,4}p\.[^\.]{3,4}$'
         with: $1
-      # or expect a numerical id at the end of the filename
-      - regex: '.*_(\d{6,})\.[^\.]{3,4}$'
+      # or expects an id starting with _xh
+      - regex: '(?i)^.+[_-](xh[^.]+)\.[^\.]{3,4}$'
         with: $1
       # or expect a numerical id at the end of the filename followed by the quality
       - regex: '.*_(\d{6,})_[\d]{3,4}p\.[^\.]{3,4}$'
         with: $1
+      # or expect a numerical id at the end of the filename
+      - regex: '.*_(\d{6,})\.[^\.]{3,4}$'
+        with: $1
       # or expect a numerical id at the start of the filename'
-      - regex: 'xhamster.com_([\d]{6,})_.*'
+      - regex: '^([\d]{6,})_.*'
+        with: $1
+      # or expect a numerical id after xhamster.com in the filename
+      - regex: '.*xhamster.com_([\d]{6,})_.*'
         with: $1
       # if no id is found in the filename
       - regex: .*\.[^\.]+$
@@ -57,12 +63,11 @@ xPathScrapers:
   sceneScraper:
     common:
       $player: //div[@class="width-wrap with-player-container"]
-      $profile: //div[@class="width-wrap with-player-container"]/nav//a[contains(@href,"/profiles/")]
-      $channel: //div[@class="width-wrap with-player-container"]/nav//a[contains(@href,"/channels/")]
-      $retiredUser: //div[contains(@data-tooltip,"User is retired")]
+      $creator: //div[@class="width-wrap with-player-container"]/nav//a[contains(@href,"/creators/")]//div[contains(@class,"content")]/span
+      $user: //div[@class="width-wrap with-player-container"]/nav//a[contains(@href,"/users/")]//div[contains(@class,"content")]/span
     scene:
-      Title: $player//h1
-      Details: //div[@class="ab-info controls-info__item xh-helper-hidden"]/p
+      Title: //meta[@property='og:title']/@content
+      # Details: //div[@class="ab-info controls-info__item xh-helper-hidden"]/p
       URL: //meta[@property='og:url']/@content|//meta[@name='twitter:url']/@content
       Date:
         selector: //div[@class="entity-info-container__date tooltip-nocache"]/@data-tooltip
@@ -71,15 +76,14 @@ xPathScrapers:
               - regex: (\d{4}-\d{2}-\d{2})\s.+
                 with: $1
           - parseDate: 2006-01-02
-      Image: //link[@as="image"]/@href
+      # Image: //link[@as="image"]/@href
       # Studio:
-      #   Name:
-      #     selector: $player/nav//a[contains(@href,"/channels/")]/span
+        # Name:
+          # selector: $player/nav//a[contains(@href,"/channels/")]//div[contains(@class,"content")]/span | $creator | $user
       # Tags:
-      #   Name:
-      #     selector: $player/nav//a[contains(@href,"/categories/") or contains(@href,"/tags/")]
+        # Name:
+          # selector: $player/nav//a[contains(@href,"/categories/") or contains(@href,"/tags/")]
       Performers:
         Name:
-          # selector: $player/nav//a[contains(@href,"/pornstars/")] | $profile/div[contains(@class,"content")]/span | $retiredUser//span
-          selector: //*[@class="entity-author-container__name"]/span
-# Last Updated February 17, 2024
+          selector: $player/nav//a[contains(@href,"/pornstars/")] | $creator | $user
+# Last Updated December 12, 2025

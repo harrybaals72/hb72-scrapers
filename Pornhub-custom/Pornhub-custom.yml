@@ -151,8 +151,8 @@ xPathScrapers:
           - replace:
               - regex: '.+?(\=)'
                 with:
-      Tags:
-        Name: $videoDetails//a[@data-label="category"] | $videoDetails//a[@data-label="tag"]
+      # Tags:
+      #   Name: $videoDetails//a[@data-label="category"] | $videoDetails//a[@data-label="tag"]
       Performers:
         Name: $videoDetails//a[@data-label="pornstar"] | $studioButton
       # Image: //meta[@property="og:image"]/@content

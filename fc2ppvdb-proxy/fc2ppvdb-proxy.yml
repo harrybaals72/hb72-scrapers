@@ -1,0 +1,16 @@
+name: fc2ppvdb-proxy
+
+sceneByURL:
+  - action: script
+    url:
+      - fc2ppvdb.com/articles/
+    script:
+      - python
+      - fc2ppvdb.py
+      - sceneByURL
+sceneByFragment:
+  action: script
+  script:
+    - python
+    - fc2ppvdb.py
+    - sceneByFragment
