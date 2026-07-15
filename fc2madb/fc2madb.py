@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -33,6 +34,9 @@ COOKIE_FILE = os.environ.get(
     "FC2CMADB_COOKIE_FILE", str(Path(__file__).with_name("cookies.json"))
 )
 REQUEST_TIMEOUT = float(os.environ.get("FC2CMADB_TIMEOUT", "30"))
+RATE_LIMIT_STATE_FILE = os.environ.get(
+    "FC2CMADB_RATE_STATE_FILE", str(Path(__file__).with_name("rate_state.json"))
+)
 ARTICLE_ID_RE = re.compile(r"(?<!\d)(\d{5,})(?!\d)")
 
 # These are only fallback names for py_common's optional config.ini.  The
@@ -197,6 +201,175 @@ def _inertia_version(html: str) -> str:
         return ""
 
 
+def _inertia_page_data(html: str) -> dict[str, Any] | None:
+    """Extract Inertia page props from the initial HTML response.
+
+    Inertia embeds the full page data in a <script data-page="app"> tag.
+    Returns the ``props`` dict, or None if it cannot be parsed.
+    """
+    match = re.search(
+        r'<script[^>]*data-page=["\']app["\'][^>]*>(.*?)</script>',
+        html,
+        re.DOTALL,
+    )
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(1))
+    except (json.JSONDecodeError, TypeError):
+        return None
+    props = parsed.get("props") if isinstance(parsed, dict) else None
+    return props if isinstance(props, dict) else None
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit state persistence
+#
+# The site sends X-RateLimit-Limit: 3 and X-RateLimit-Remaining: N (Laravel
+# throttle middleware).  Since each script invocation is an independent
+# process, we use a small JSON file to track cooldown state across calls.
+# ---------------------------------------------------------------------------
+
+
+_RATE_STATE_VERSION = 1
+_DEFAULT_WINDOW_SECONDS = 60
+
+
+def _load_rate_state() -> dict[str, Any]:
+    """Load rate-limit state from ``RATE_LIMIT_STATE_FILE``."""
+    path = Path(RATE_LIMIT_STATE_FILE)
+    if path.is_file():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict) and raw.get("version") == _RATE_STATE_VERSION:
+                remaining = raw.get("remaining", "?")
+                cooldown = raw.get("cooldown_until", 0.0)
+                log.info(
+                    f"[fc2madb.py] Rate-limit state loaded: remaining={remaining}, "
+                    f"cooldown={'{:.1f}s'.format(cooldown - time.time()) if cooldown > time.time() else 'none'}"
+                )
+                return raw
+        except (OSError, json.JSONDecodeError) as exc:
+            log.debug(f"Unable to read rate state {path}: {exc}")
+    log.info("[fc2madb.py] Rate-limit state: fresh start (no prior state file)")
+    return {
+        "version": _RATE_STATE_VERSION,
+        "cooldown_until": 0.0,
+        "window_start": 0.0,
+        "limit": 3,
+        "remaining": 3,
+    }
+
+
+def _save_rate_state(state: dict[str, Any]) -> None:
+    """Atomically write rate-limit state to ``RATE_LIMIT_STATE_FILE``."""
+    path = Path(RATE_LIMIT_STATE_FILE)
+    try:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(state, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+    except OSError as exc:
+        log.warning(f"Unable to write rate state {path}: {exc}")
+
+
+def _wait_for_cooldown(state: dict[str, Any]) -> None:
+    """Sleep until the cooldown period expires, if applicable."""
+    remaining = state["cooldown_until"] - time.time()
+    if remaining > 0:
+        log.info(
+            f"[fc2madb.py] Rate-limit cooldown: sleeping {remaining:.1f}s "
+            f"(remaining={state.get('remaining', '?')}, "
+            f"limit={state.get('limit', '?')})"
+        )
+        time.sleep(remaining)
+
+
+def _update_rate_state_from_headers(
+    state: dict[str, Any],
+    headers: dict[str, str],
+) -> dict[str, Any]:
+    """Update rate-limit state from response headers.
+
+    Looks for ``X-RateLimit-Remaining`` and optionally
+    ``X-RateLimit-Reset`` / ``Retry-After``.  If the remaining count has
+    dropped to 1 or 0, we set a cooldown so the next invocation waits.
+    """
+    now = time.time()
+
+    # Extract headers (case-insensitive lookup)
+    remaining_str = ""
+    reset_str = ""
+    retry_str = ""
+    for k, v in headers.items():
+        k_lower = k.lower()
+        if k_lower == "x-ratelimit-remaining":
+            remaining_str = v
+        elif k_lower == "x-ratelimit-reset":
+            reset_str = v
+        elif k_lower == "retry-after":
+            retry_str = v
+
+    if not remaining_str:
+        return state
+
+    try:
+        remaining = int(remaining_str)
+    except (TypeError, ValueError):
+        return state
+
+    state["remaining"] = remaining
+
+    # Determine cooldown duration
+    cooldown = 0.0
+    cooldown_source = ""
+
+    if reset_str:
+        try:
+            cooldown = float(reset_str) - now
+            cooldown_source = "X-RateLimit-Reset"
+        except (TypeError, ValueError):
+            cooldown = 0.0
+    elif retry_str:
+        try:
+            cooldown = float(retry_str)
+            cooldown_source = "Retry-After"
+        except (TypeError, ValueError):
+            cooldown = 0.0
+
+    if cooldown <= 0 and remaining <= 1:
+        # No explicit reset time — use a heuristic: if the window started
+        # recently, estimate the remaining window duration.
+        elapsed = now - state.get("window_start", 0.0)
+        if elapsed < _DEFAULT_WINDOW_SECONDS and elapsed > 0:
+            cooldown = _DEFAULT_WINDOW_SECONDS - elapsed
+            cooldown_source = "heuristic (window {:.0f}s ago)".format(elapsed)
+        else:
+            cooldown = _DEFAULT_WINDOW_SECONDS
+            cooldown_source = "heuristic (default window)"
+        # Start a new window tracking point if we don't have one
+        if state.get("window_start", 0.0) <= 0 or elapsed >= _DEFAULT_WINDOW_SECONDS:
+            state["window_start"] = now
+
+    if cooldown > 0:
+        state["cooldown_until"] = now + cooldown
+        log.info(
+            f"[fc2madb.py] Rate-limit: remaining={remaining}/{state.get('limit', '?')}, "
+            f"cooldown={cooldown:.0f}s ({cooldown_source})"
+        )
+    else:
+        state["cooldown_until"] = 0.0
+        if remaining <= 1:
+            log.info(
+                f"[fc2madb.py] Rate-limit: remaining={remaining}/{state.get('limit', '?')}, "
+                f"no cooldown needed"
+            )
+
+    return state
+
+
 def _article_id_from_value(value: Any) -> str:
     if not isinstance(value, str):
         return ""
@@ -307,9 +480,18 @@ def scene_from_url(url: str) -> ScrapedScene:
         )
         return _failure_result("FC2MADB: Auth Error", url=url)
 
+    # ---- Rate-limit: load state and wait if in cooldown ----
+    rate_state = _load_rate_state()
+    _wait_for_cooldown(rate_state)
+
     solution = _get_flaresolverr_solution(url, cookies)
     session = _new_session(solution, cookies)
     initial_html = str(solution.get("response", "")) if solution else ""
+
+    # Track where headers came from for rate-limit state updates
+    response_headers: dict[str, str] | None = None
+    if solution and isinstance(solution.get("headers"), dict):
+        response_headers = solution["headers"]
 
     try:
         if _login_page(initial_html):
@@ -324,53 +506,76 @@ def scene_from_url(url: str) -> ScrapedScene:
                 log.error(f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  login prompt in direct fetch")
                 return _failure_result("FC2MADB: Auth Error", url=url)
             initial_html = initial.text
+            if response_headers is None:
+                response_headers = dict(initial.headers)
     except requests.RequestException as exc:
         log.error(f"[fc2madb.py] FAILURE TYPE=unreachable  URL={url}  {exc}")
         return _failure_result("FC2MADB: Unreachable", details=str(exc), url=url)
 
-    version = _inertia_version(initial_html)
-    if not version:
-        log.error(f"[fc2madb.py] FAILURE TYPE=parse_error  URL={url}  no Inertia version in HTML")
-        return _failure_result("FC2MADB: Parse Error", url=url)
-
-    session.headers.update(
-        {
-            "X-Inertia": "true",
-            "X-Requested-With": "XMLHttpRequest",
-            "X-Inertia-Partial-Component": "Articles/Show",
-            "X-Inertia-Partial-Data": "article,actresses",
-            "X-Inertia-Version": version,
-            "Referer": url,
-            "Accept": "text/html, application/xhtml+xml",
-            "Cache-Control": "no-cache",
-        }
-    )
-
-    try:
-        info_response = session.get(url, timeout=REQUEST_TIMEOUT)
-        if _login_page(info_response.text, info_response.url):
-            log.error(f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  Inertia GET redirected to login")
-            return _failure_result("FC2MADB: Auth Error", url=url)
-        if info_response.status_code != 200:
-            log.error(f"[fc2madb.py] FAILURE TYPE=http_{info_response.status_code}  URL={url}")
-            tag_name = (
-                "FC2MADB: Not Found"
-                if info_response.status_code == 404
-                else "FC2MADB: Rate Limited"
-                if info_response.status_code == 429
-                else "FC2MADB: Unreachable"
+    # ---- Parse Inertia page data from the initial HTML response ----
+    # The initial HTML (from FlareSolverr or direct GET) contains the full
+    # page data embedded in a <script data-page="app"> tag.  Extracting it
+    # directly avoids a second GET request, halving our request count and
+    # staying well within the site's aggressive X-RateLimit-Limit: 3 budget.
+    props = _inertia_page_data(initial_html)
+    if not props:
+        # Fallback: make an Inertia JSON GET if the initial HTML didn't
+        # contain parseable page data.
+        version = _inertia_version(initial_html)
+        if not version:
+            log.error(
+                f"[fc2madb.py] FAILURE TYPE=parse_error  URL={url}  no Inertia version in HTML"
             )
-            return _failure_result(
-                tag_name,
-                details=f"HTTP {info_response.status_code}",
-                url=url,
-            )
-        payload = info_response.json()
-    except (requests.RequestException, ValueError) as exc:
-        log.error(f"[fc2madb.py] FAILURE TYPE=parse_error  URL={url}  {exc}")
-        return _failure_result("FC2MADB: Parse Error", details=str(exc), url=url)
+            return _failure_result("FC2MADB: Parse Error", url=url)
 
-    props = payload.get("props", {}) if isinstance(payload, dict) else {}
+        session.headers.update(
+            {
+                "X-Inertia": "true",
+                "X-Requested-With": "XMLHttpRequest",
+                "X-Inertia-Partial-Component": "Articles/Show",
+                "X-Inertia-Partial-Data": "article,actresses",
+                "X-Inertia-Version": version,
+                "Referer": url,
+                "Accept": "text/html, application/xhtml+xml",
+                "Cache-Control": "no-cache",
+            }
+        )
+
+        try:
+            info_response = session.get(url, timeout=REQUEST_TIMEOUT)
+            if _login_page(info_response.text, info_response.url):
+                log.error(
+                    f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  Inertia GET redirected to login"
+                )
+                return _failure_result("FC2MADB: Auth Error", url=url)
+            if info_response.status_code != 200:
+                log.error(
+                    f"[fc2madb.py] FAILURE TYPE=http_{info_response.status_code}  URL={url}"
+                )
+                tag_name = (
+                    "FC2MADB: Not Found"
+                    if info_response.status_code == 404
+                    else "FC2MADB: Rate Limited"
+                    if info_response.status_code == 429
+                    else "FC2MADB: Unreachable"
+                )
+                return _failure_result(
+                    tag_name,
+                    details=f"HTTP {info_response.status_code}",
+                    url=url,
+                )
+            payload = info_response.json()
+            props = payload.get("props", {}) if isinstance(payload, dict) else {}
+            if response_headers is None:
+                response_headers = dict(info_response.headers)
+        except (requests.RequestException, ValueError) as exc:
+            log.error(f"[fc2madb.py] FAILURE TYPE=parse_error  URL={url}  {exc}")
+            return _failure_result("FC2MADB: Parse Error", details=str(exc), url=url)
+
+    # ---- Update rate-limit state from response headers ----
+    if response_headers:
+        _update_rate_state_from_headers(rate_state, response_headers)
+        _save_rate_state(rate_state)
     article = props.get("article") if isinstance(props, dict) else None
     if not isinstance(article, dict):
         log.error(f"[fc2madb.py] FAILURE TYPE=not_found  URL={url}  article object missing")
