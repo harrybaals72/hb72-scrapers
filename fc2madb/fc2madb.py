@@ -313,11 +313,19 @@ def _update_rate_state_from_headers(
             retry_str = v
 
     if not remaining_str:
+        log.info(
+            "[fc2madb.py] Rate-limit headers not present in response — "
+            "site may not be throttling this request"
+        )
         return state
 
     try:
         remaining = int(remaining_str)
     except (TypeError, ValueError):
+        log.warning(
+            f"[fc2madb.py] Rate-limit header unparseable: "
+            f"X-RateLimit-Remaining={remaining_str!r}"
+        )
         return state
 
     state["remaining"] = remaining
@@ -486,31 +494,53 @@ def scene_from_url(url: str) -> ScrapedScene:
 
     solution = _get_flaresolverr_solution(url, cookies)
     session = _new_session(solution, cookies)
-    initial_html = str(solution.get("response", "")) if solution else ""
 
-    # Track where headers came from for rate-limit state updates
+    # ---- Always try a direct GET ----
+    # The session has FlareSolverr's cookies and User-Agent when available,
+    # so it should bypass Cloudflare.  We use this request for BOTH the
+    # page body (Inertia parsing) and the response headers (rate-limit
+    # tracking).  Only fall back to the FlareSolverr solution body when the
+    # direct GET is blocked.
     response_headers: dict[str, str] | None = None
-    if solution and isinstance(solution.get("headers"), dict):
-        response_headers = solution["headers"]
+    initial_html = ""
 
     try:
-        if _login_page(initial_html):
-            log.error(f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  login prompt in FlareSolverr response")
-            return _failure_result("FC2MADB: Auth Error", url=url)
-        if not _inertia_version(initial_html):
-            initial = session.get(url, timeout=REQUEST_TIMEOUT)
-            if initial.status_code == 403 and "1005" in initial.text:
-                log.error(f"[fc2madb.py] FAILURE TYPE=cloudflare  URL={url}  ASN block")
+        initial = session.get(url, timeout=REQUEST_TIMEOUT)
+        if initial.status_code == 403 and "1005" in initial.text:
+            # Cloudflare block — use FlareSolverr solution body
+            if not solution:
+                log.error(
+                    f"[fc2madb.py] FAILURE TYPE=cloudflare  URL={url}  "
+                    "ASN block and no FlareSolverr fallback"
+                )
                 return _failure_result("FC2MADB: Cloudflare Blocked", url=url)
-            if _login_page(initial.text, initial.url):
-                log.error(f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  login prompt in direct fetch")
-                return _failure_result("FC2MADB: Auth Error", url=url)
+            initial_html = str(solution.get("response", ""))
+            if isinstance(solution.get("headers"), dict):
+                response_headers = solution["headers"]
+        elif _login_page(initial.text, initial.url):
+            log.error(
+                f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  login prompt in direct fetch"
+            )
+            return _failure_result("FC2MADB: Auth Error", url=url)
+        else:
+            # Direct GET succeeded — use its body and headers
             initial_html = initial.text
-            if response_headers is None:
-                response_headers = dict(initial.headers)
+            response_headers = dict(initial.headers)
     except requests.RequestException as exc:
-        log.error(f"[fc2madb.py] FAILURE TYPE=unreachable  URL={url}  {exc}")
-        return _failure_result("FC2MADB: Unreachable", details=str(exc), url=url)
+        # Network error — use FlareSolverr solution body if available
+        if not solution:
+            log.error(f"[fc2madb.py] FAILURE TYPE=unreachable  URL={url}  {exc}")
+            return _failure_result("FC2MADB: Unreachable", details=str(exc), url=url)
+        initial_html = str(solution.get("response", ""))
+        if isinstance(solution.get("headers"), dict):
+            response_headers = solution["headers"]
+
+    if _login_page(initial_html):
+        log.error(
+            f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  "
+            "login prompt in initial response"
+        )
+        return _failure_result("FC2MADB: Auth Error", url=url)
 
     # ---- Parse Inertia page data from the initial HTML response ----
     # The initial HTML (from FlareSolverr or direct GET) contains the full
@@ -576,6 +606,11 @@ def scene_from_url(url: str) -> ScrapedScene:
     if response_headers:
         _update_rate_state_from_headers(rate_state, response_headers)
         _save_rate_state(rate_state)
+    else:
+        log.warning(
+            f"[fc2madb.py] No rate-limit headers found in response for {url} — "
+            "throttling will not be applied for subsequent scrapes"
+        )
     article = props.get("article") if isinstance(props, dict) else None
     if not isinstance(article, dict):
         log.error(f"[fc2madb.py] FAILURE TYPE=not_found  URL={url}  article object missing")
