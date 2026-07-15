@@ -583,8 +583,15 @@ def scene_from_url(url: str) -> ScrapedScene:
 
     scene: ScrapedScene = {}
     title = str(article.get("title") or "").strip()
+    # Title goes into details, not the scene title
+    description = str(article.get("description") or article.get("details") or "").strip()
     if title:
-        scene["title"] = title
+        if description:
+            scene["details"] = f"{title}\n{description}"
+        else:
+            scene["details"] = title
+    elif description:
+        scene["details"] = description
 
     video_id = article.get("video_id")
     if video_id:
