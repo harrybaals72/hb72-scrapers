@@ -207,6 +207,12 @@ def _article_id_from_value(value: Any) -> str:
     return match.group(1) if match else ""
 
 
+def _article_id_from_url(url: str) -> str:
+    """Extract the numeric article ID from a full fc2cmadb article URL."""
+    match = re.search(r"/articles/(\d{5,})(?:[/?#]|$)", url)
+    return match.group(1) if match else ""
+
+
 def _url_from_fragment(args: dict[str, Any]) -> str:
     for value in args.get("urls", []) if isinstance(args.get("urls"), list) else []:
         article_id = _article_id_from_value(value)
@@ -253,52 +259,79 @@ def _duration_seconds(value: Any) -> int | None:
     return None
 
 
+def _failure_result(
+    tag_name: str,
+    *,
+    details: str = "",
+    url: str = "",
+) -> ScrapedScene:
+    """Return a scraped scene with a single sentinel tag and optional metadata.
+
+    Preserves the scene's FC2 code (extracted from *url*) so the code is not
+    wiped on failure.  *details* is appended to the code as a human-readable
+    suffix.
+    """
+    result: ScrapedScene = {
+        "tags": [{"name": tag_name}],
+    }
+
+    article_id = _article_id_from_url(url)
+    if article_id:
+        result["code"] = f"FC2-PPV-{article_id}"
+
+    if details:
+        result["details"] = details
+
+    if url:
+        result["urls"] = [url]
+
+    return result
+
+
 def scene_from_url(url: str) -> ScrapedScene:
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or parsed.hostname not in {
         SITE_HOST,
         f"www.{SITE_HOST}",
     }:
-        log.error(f"[fc2madb.py] Unsupported FC2MADB URL: {url}")
-        return {}
+        log.error(f"[fc2madb.py] FAILURE TYPE=unsupported_url  URL={url}")
+        return _failure_result("FC2MADB: Parse Error", url=url)
 
     cookies = _load_cookies()
     if not cookies.get("fc2cmadb-session") or not cookies.get("XSRF-TOKEN"):
         log.error(
-            f"[fc2madb.py] Missing fc2cmadb-session or XSRF-TOKEN for {url}. "
+            f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  "
+            f"missing fc2cmadb-session or XSRF-TOKEN. "
             f"Put a browser cookie export in {COOKIE_FILE} or set "
             "FC2CMADB_SESSION and FC2CMADB_XSRF_TOKEN."
         )
-        return {}
+        return _failure_result("FC2MADB: Auth Error", url=url)
 
     solution = _get_flaresolverr_solution(url, cookies)
     session = _new_session(solution, cookies)
     initial_html = str(solution.get("response", "")) if solution else ""
 
     try:
-        # FlareSolverr normally includes the solved page in solution.response.
-        # Fetch it again if an older FlareSolverr build omitted that field or
-        # returned a challenge page instead of the application HTML.
         if _login_page(initial_html):
-            log.error(f"[fc2madb.py] Login prompt detected for {url}; refresh the supplied cookies")
-            return {}
+            log.error(f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  login prompt in FlareSolverr response")
+            return _failure_result("FC2MADB: Auth Error", url=url)
         if not _inertia_version(initial_html):
             initial = session.get(url, timeout=REQUEST_TIMEOUT)
             if initial.status_code == 403 and "1005" in initial.text:
-                log.error(f"[fc2madb.py] Cloudflare ASN block detected for {url}")
-                return {}
+                log.error(f"[fc2madb.py] FAILURE TYPE=cloudflare  URL={url}  ASN block")
+                return _failure_result("FC2MADB: Cloudflare Blocked", url=url)
             if _login_page(initial.text, initial.url):
-                log.error(f"[fc2madb.py] Login prompt detected for {url}; refresh the supplied cookies")
-                return {}
+                log.error(f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  login prompt in direct fetch")
+                return _failure_result("FC2MADB: Auth Error", url=url)
             initial_html = initial.text
     except requests.RequestException as exc:
-        log.error(f"[fc2madb.py] Unable to fetch {url}: {exc}")
-        return {}
+        log.error(f"[fc2madb.py] FAILURE TYPE=unreachable  URL={url}  {exc}")
+        return _failure_result("FC2MADB: Unreachable", details=str(exc), url=url)
 
     version = _inertia_version(initial_html)
     if not version:
-        log.error(f"[fc2madb.py] Unable to extract the fc2cmadb Inertia version for {url}")
-        return {}
+        log.error(f"[fc2madb.py] FAILURE TYPE=parse_error  URL={url}  no Inertia version in HTML")
+        return _failure_result("FC2MADB: Parse Error", url=url)
 
     session.headers.update(
         {
@@ -316,21 +349,32 @@ def scene_from_url(url: str) -> ScrapedScene:
     try:
         info_response = session.get(url, timeout=REQUEST_TIMEOUT)
         if _login_page(info_response.text, info_response.url):
-            log.error(f"[fc2madb.py] Article request redirected to login for {url}; refresh the supplied cookies")
-            return {}
+            log.error(f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  Inertia GET redirected to login")
+            return _failure_result("FC2MADB: Auth Error", url=url)
         if info_response.status_code != 200:
-            log.error(f"[fc2madb.py] Article request for {url} returned HTTP {info_response.status_code}")
-            return {}
+            log.error(f"[fc2madb.py] FAILURE TYPE=http_{info_response.status_code}  URL={url}")
+            tag_name = (
+                "FC2MADB: Not Found"
+                if info_response.status_code == 404
+                else "FC2MADB: Rate Limited"
+                if info_response.status_code == 429
+                else "FC2MADB: Unreachable"
+            )
+            return _failure_result(
+                tag_name,
+                details=f"HTTP {info_response.status_code}",
+                url=url,
+            )
         payload = info_response.json()
     except (requests.RequestException, ValueError) as exc:
-        log.error(f"[fc2madb.py] Invalid article response for {url}: {exc}")
-        return {}
+        log.error(f"[fc2madb.py] FAILURE TYPE=parse_error  URL={url}  {exc}")
+        return _failure_result("FC2MADB: Parse Error", details=str(exc), url=url)
 
     props = payload.get("props", {}) if isinstance(payload, dict) else {}
     article = props.get("article") if isinstance(props, dict) else None
     if not isinstance(article, dict):
-        log.error(f"[fc2madb.py] No article data found at {url}")
-        return {}
+        log.error(f"[fc2madb.py] FAILURE TYPE=not_found  URL={url}  article object missing")
+        return _failure_result("FC2MADB: Not Found", url=url)
 
     scene: ScrapedScene = {}
     title = str(article.get("title") or "").strip()
@@ -380,9 +424,13 @@ if __name__ == "__main__":
     elif operation in {"scene-by-fragment", "scene-by-query-fragment"}:
         url = _url_from_fragment(args)
         if not url:
-            log.error(f"[fc2madb.py] Could not extract an FC2 article ID from the scene fragment: {json.dumps(args)}")
-            sys.exit(1)
-        result = scene_from_url(url)
+            log.warning(
+                f"[fc2madb.py] No FC2 article ID found in fragment; nothing to scrape. "
+                f"Fragment keys: {list(args.keys())}"
+            )
+            result = {}
+        else:
+            result = scene_from_url(url)
     else:
         log.error(f"[fc2madb.py] Unsupported operation: {operation}; arguments: {json.dumps(args)}")
         sys.exit(1)
