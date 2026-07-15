@@ -167,18 +167,18 @@ def _get_flaresolverr_solution(url: str, cookies: dict[str, str]) -> dict[str, A
 
     if response.status_code != 200:
         log.warning(
-            f"FlareSolverr returned HTTP {response.status_code}; trying a direct request"
+            f"FlareSolverr returned HTTP {response.status_code} for {url}; trying a direct request"
         )
         return None
 
     try:
         body = response.json()
     except ValueError:
-        log.warning("FlareSolverr returned invalid JSON; trying a direct request")
+        log.warning(f"FlareSolverr returned invalid JSON for {url}; trying a direct request")
         return None
 
     if body.get("status") not in (None, "ok") or not isinstance(body.get("solution"), dict):
-        log.warning(f"FlareSolverr did not return a usable solution: {body.get('message', 'unknown error')}")
+        log.warning(f"FlareSolverr did not return a usable solution for {url}: {body.get('message', 'unknown error')}")
         return None
     return body["solution"]
 
@@ -259,14 +259,15 @@ def scene_from_url(url: str) -> ScrapedScene:
         SITE_HOST,
         f"www.{SITE_HOST}",
     }:
-        log.error(f"Unsupported FC2MADB URL: {url}")
+        log.error(f"[fc2madb.py] Unsupported FC2MADB URL: {url}")
         return {}
 
     cookies = _load_cookies()
     if not cookies.get("fc2cmadb-session") or not cookies.get("XSRF-TOKEN"):
         log.error(
-            "Missing fc2cmadb-session or XSRF-TOKEN. Put a browser cookie export in "
-            f"{COOKIE_FILE} or set FC2CMADB_SESSION and FC2CMADB_XSRF_TOKEN."
+            f"[fc2madb.py] Missing fc2cmadb-session or XSRF-TOKEN for {url}. "
+            f"Put a browser cookie export in {COOKIE_FILE} or set "
+            "FC2CMADB_SESSION and FC2CMADB_XSRF_TOKEN."
         )
         return {}
 
@@ -279,24 +280,24 @@ def scene_from_url(url: str) -> ScrapedScene:
         # Fetch it again if an older FlareSolverr build omitted that field or
         # returned a challenge page instead of the application HTML.
         if _login_page(initial_html):
-            log.error("FC2MADB login prompt detected; refresh the supplied cookies")
+            log.error(f"[fc2madb.py] Login prompt detected for {url}; refresh the supplied cookies")
             return {}
         if not _inertia_version(initial_html):
             initial = session.get(url, timeout=REQUEST_TIMEOUT)
             if initial.status_code == 403 and "1005" in initial.text:
-                log.error("Cloudflare ASN block detected for fc2cmadb.com")
+                log.error(f"[fc2madb.py] Cloudflare ASN block detected for {url}")
                 return {}
             if _login_page(initial.text, initial.url):
-                log.error("FC2MADB login prompt detected; refresh the supplied cookies")
+                log.error(f"[fc2madb.py] Login prompt detected for {url}; refresh the supplied cookies")
                 return {}
             initial_html = initial.text
     except requests.RequestException as exc:
-        log.error(f"Unable to fetch FC2MADB article page: {exc}")
+        log.error(f"[fc2madb.py] Unable to fetch {url}: {exc}")
         return {}
 
     version = _inertia_version(initial_html)
     if not version:
-        log.error("Unable to extract the fc2cmadb Inertia version")
+        log.error(f"[fc2madb.py] Unable to extract the fc2cmadb Inertia version for {url}")
         return {}
 
     session.headers.update(
@@ -315,20 +316,20 @@ def scene_from_url(url: str) -> ScrapedScene:
     try:
         info_response = session.get(url, timeout=REQUEST_TIMEOUT)
         if _login_page(info_response.text, info_response.url):
-            log.error("FC2MADB article request redirected to login; refresh the supplied cookies")
+            log.error(f"[fc2madb.py] Article request redirected to login for {url}; refresh the supplied cookies")
             return {}
         if info_response.status_code != 200:
-            log.error(f"FC2MADB article request returned HTTP {info_response.status_code}")
+            log.error(f"[fc2madb.py] Article request for {url} returned HTTP {info_response.status_code}")
             return {}
         payload = info_response.json()
     except (requests.RequestException, ValueError) as exc:
-        log.error(f"Invalid FC2MADB article response: {exc}")
+        log.error(f"[fc2madb.py] Invalid article response for {url}: {exc}")
         return {}
 
     props = payload.get("props", {}) if isinstance(payload, dict) else {}
     article = props.get("article") if isinstance(props, dict) else None
     if not isinstance(article, dict):
-        log.error(f"No article data found at {url}")
+        log.error(f"[fc2madb.py] No article data found at {url}")
         return {}
 
     scene: ScrapedScene = {}
@@ -379,11 +380,11 @@ if __name__ == "__main__":
     elif operation in {"scene-by-fragment", "scene-by-query-fragment"}:
         url = _url_from_fragment(args)
         if not url:
-            log.error("Could not extract an FC2 article ID from the scene fragment")
+            log.error(f"[fc2madb.py] Could not extract an FC2 article ID from the scene fragment: {json.dumps(args)}")
             sys.exit(1)
         result = scene_from_url(url)
     else:
-        log.error(f"Unsupported operation: {operation}; arguments: {json.dumps(args)}")
+        log.error(f"[fc2madb.py] Unsupported operation: {operation}; arguments: {json.dumps(args)}")
         sys.exit(1)
 
     print(json.dumps(result, ensure_ascii=False))
