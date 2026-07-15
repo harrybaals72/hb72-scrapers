@@ -1,0 +1,12 @@
+id: fc2madb
+name: fc2madb
+metadata: {}
+version: 1.0.0
+date: "2026-07-15 19:25:54"
+requires: []
+# The cookie export is intentionally not packaged. Copy cookies.json next to
+# fc2madb.py or configure FC2CMADB_COOKIE_FILE/FC2CMADB_* environment variables.
+files:
+- README.md
+- fc2madb.yml
+- fc2madb.py

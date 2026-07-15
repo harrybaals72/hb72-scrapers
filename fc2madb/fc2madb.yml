@@ -1,0 +1,25 @@
+name: fc2madb
+# requires: py_common
+
+sceneByURL:
+  - url:
+      - fc2cmadb.com/articles/
+    action: script
+    script:
+      - python
+      - fc2madb.py
+      - scene-by-url
+
+sceneByFragment:
+  action: script
+  script:
+    - python
+    - fc2madb.py
+    - scene-by-fragment
+
+sceneByQueryFragment:
+  action: script
+  script:
+    - python
+    - fc2madb.py
+    - scene-by-query-fragment

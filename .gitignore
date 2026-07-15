@@ -1,0 +1,7 @@
+# Local authentication material for the FC2MADB scraper.
+fc2madb/cookies.json
+fc2madb/config.ini
+
+# Python bytecode.
+__pycache__/
+*.py[cod]
