@@ -1,6 +1,7 @@
-# Local authentication material for the FC2MADB scraper.
+# Local authentication material and runtime state for the FC2MADB scraper.
 fc2madb/cookies.json
 fc2madb/config.ini
+fc2madb/rate_state.json
 
 # Python bytecode.
 __pycache__/
