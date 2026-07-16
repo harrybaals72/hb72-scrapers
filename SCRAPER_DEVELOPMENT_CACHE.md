@@ -46,6 +46,16 @@ When a scraper cannot return a complete scene, it can return a scene containing 
 
 For the Identify task, pre-create the sentinel tag so post-processing resolves it, or enable `createMissing` for tags in the source config.
 
+### fc2cmadb.com rate-limit behavior (verified 2026-07-16)
+
+See `fc2madb/RATE_LIMIT_FINDINGS.md` for full details.
+
+- Laravel throttle: **limit=3, window=~1-1.5s**. No `X-RateLimit-Reset` or `Retry-After` headers ever.
+- 429 response has NO rate-limit headers. Inertia component is `"Error"`, version is `""`.
+- `remember_web` cookie is deleted on 429 (Max-Age=0). Session cookies are still refreshed.
+- The scraper's 60-second heuristic cooldown is ~40-60x too long for the actual window.
+- 429 is not detected in the primary direct-GET path; it falls through to "everything else" and triggers an unnecessary Inertia fallback GET.
+
 ## Maintenance rules
 
 - Add or revise an entry only after verifying it in the current Stash source; include the most direct source paths.

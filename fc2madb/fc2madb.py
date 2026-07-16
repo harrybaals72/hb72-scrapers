@@ -28,7 +28,7 @@ import requests
 
 SITE_HOST = "fc2cmadb.com"
 FLARESOLVERR_URL = os.environ.get(
-    "FLARESOLVERR_URL", "http://9.9.9.200:8191/v1"
+    "FLARESOLVERR_URL", "http://localhost:8191/v1"
 )
 COOKIE_FILE = os.environ.get(
     "FC2CMADB_COOKIE_FILE", str(Path(__file__).with_name("cookies.json"))
@@ -232,7 +232,7 @@ def _inertia_page_data(html: str) -> dict[str, Any] | None:
 
 
 _RATE_STATE_VERSION = 1
-_DEFAULT_WINDOW_SECONDS = 60
+_DEFAULT_WINDOW_SECONDS = 5
 
 
 def _load_rate_state() -> dict[str, Any]:
@@ -517,6 +517,19 @@ def scene_from_url(url: str) -> ScrapedScene:
             initial_html = str(solution.get("response", ""))
             if isinstance(solution.get("headers"), dict):
                 response_headers = solution["headers"]
+        elif initial.status_code == 429:
+            log.error(
+                f"[fc2madb.py] FAILURE TYPE=http_429  URL={url}  "
+                "rate limit exceeded — session invalidated"
+            )
+            # Don't save rate state: cookies are dead after a 429. The user
+            # must re-sign in and provide fresh cookies. The next invocation
+            # with fresh cookies starts from a clean rate state.
+            return _failure_result(
+                "FC2MADB: Rate Limited",
+                details="HTTP 429 Too Many Requests — session expired, re-authenticate",
+                url=url,
+            )
         elif _login_page(initial.text, initial.url):
             log.error(
                 f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  login prompt in direct fetch"
