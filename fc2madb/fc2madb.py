@@ -237,6 +237,7 @@ def _inertia_page_data(html: str) -> dict[str, Any] | None:
 
 _RATE_STATE_VERSION = 1
 _DEFAULT_WINDOW_SECONDS = 5
+_ZERO_REMAINING_COOLDOWN_SECONDS = 30
 
 
 def _load_rate_state() -> dict[str, Any]:
@@ -363,7 +364,12 @@ def _update_rate_state_from_headers(
         except (TypeError, ValueError):
             cooldown = 0.0
 
-    if cooldown <= 0 and remaining <= 1:
+    if remaining == 0:
+        # Zero remaining is an exhausted quota. Use the explicit safety
+        # cooldown even when the server supplies no reset/retry header.
+        cooldown = _ZERO_REMAINING_COOLDOWN_SECONDS
+        cooldown_source = "zero remaining"
+    elif cooldown <= 0 and remaining == 1:
         # No explicit reset time — use a heuristic: if the window started
         # recently, estimate the remaining window duration.
         elapsed = now - state.get("window_start", 0.0)
@@ -395,10 +401,9 @@ def _update_rate_state_from_headers(
 
 
 def _force_rate_limit_cooldown(state: dict[str, Any]) -> None:
-    """Force a cooldown for a 429, whose response has no rate headers."""
+    """Force the zero-remaining cooldown for a 429 without rate headers."""
     now = time.time()
-    elapsed = now - state.get("window_start", 0.0)
-    cooldown = max(_DEFAULT_WINDOW_SECONDS - elapsed, _DEFAULT_WINDOW_SECONDS)
+    cooldown = _ZERO_REMAINING_COOLDOWN_SECONDS
     state["remaining"] = 0
     state["cooldown_until"] = now + cooldown
     state["window_start"] = now

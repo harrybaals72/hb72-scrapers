@@ -3,6 +3,7 @@ import json
 import logging
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -142,6 +143,20 @@ class ScraperTests(unittest.TestCase):
         )
         self.assertEqual(result, {})
 
+    def test_zero_remaining_header_persists_30_second_cooldown(self):
+        response = FakeResponse(
+            status_code=404,
+            text=initial_html(status=404),
+            headers={"X-RateLimit-Limit": "3", "X-RateLimit-Remaining": "0"},
+        )
+        result, session = self.run_scrape([response])
+        self.assertEqual(result, {"tags": [{"name": "FC2MADB 404"}]})
+        self.assertEqual(len(session.calls), 1)
+        state = json.loads(Path(self.rate_file).read_text())
+        cooldown = state["cooldown_until"] - time.time()
+        self.assertGreaterEqual(cooldown, 29)
+        self.assertLessEqual(cooldown, 30.5)
+
     def test_deferred_429_is_saved_and_never_returns_partial_metadata(self):
         deferred_429 = FakeResponse(status_code=429, text="rate limited", headers={})
         result, session = self.run_scrape(
@@ -151,7 +166,9 @@ class ScraperTests(unittest.TestCase):
         self.assertEqual(len(session.calls), 2)
         state = json.loads(Path(self.rate_file).read_text())
         self.assertEqual(state["remaining"], 0)
-        self.assertGreater(state["cooldown_until"], 0)
+        cooldown = state["cooldown_until"] - time.time()
+        self.assertGreaterEqual(cooldown, 29)
+        self.assertLessEqual(cooldown, 30.5)
 
     def test_flaresolverr_404_uses_authenticated_props_status(self):
         solution_html = initial_html(user=True, article=False, status=404)
@@ -191,7 +208,9 @@ class ScraperTests(unittest.TestCase):
         self.assertEqual(result, {})
         state = json.loads(Path(self.rate_file).read_text())
         self.assertEqual(state["remaining"], 0)
-        self.assertGreater(state["cooldown_until"], 0)
+        cooldown = state["cooldown_until"] - time.time()
+        self.assertGreaterEqual(cooldown, 29)
+        self.assertLessEqual(cooldown, 30.5)
         self.assertEqual(len(session.calls), 1)
 
     def test_direct_request_exception_does_not_invoke_flaresolverr(self):

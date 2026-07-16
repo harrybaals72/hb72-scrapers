@@ -2,7 +2,7 @@
 
 ## Summary
 
-The site uses a Laravel throttle middleware with a limit of **3 requests per window**. The window duration is approximately **1–1.5 seconds**. No `X-RateLimit-Reset` or `Retry-After` headers are provided on any response (200 or 429). The scraper uses a conservative **5-second** safety cooldown when no server reset is supplied. On a 429, the `remember_web` cookie is deleted (Max-Age=0), which logs the user out of their browser session.
+The site uses a Laravel throttle middleware with a limit of **3 requests per window**. The window duration is approximately **1–1.5 seconds**. No `X-RateLimit-Reset` or `Retry-After` headers are provided on any response (200 or 429). The scraper uses a **30-second** safety cooldown when `X-RateLimit-Remaining` is `0`, and a **5-second** heuristic for `X-RateLimit-Remaining` equal to `1` when no server reset is supplied. On a 429, the `remember_web` cookie is deleted (Max-Age=0), which logs the user out of their browser session.
 
 ## Headers Observed
 
@@ -51,9 +51,9 @@ Rapid-fire testing (0.0s delay between requests):
 
 ## Current scraper behavior
 
-- `_DEFAULT_WINDOW_SECONDS` is 5 seconds, used only when the server supplies no reset value.
+- `_DEFAULT_WINDOW_SECONDS` is 5 seconds for a response with one request remaining when the server supplies no reset value; zero remaining uses a 30-second cooldown.
 - Every direct, fallback, deferred, retry, and FlareSolverr-represented origin response is recorded immediately.
-- 429 responses are transient: rate state is saved, a 5-second cooldown is forced, and the scraper returns an empty result.
+- 429 responses are transient: rate state is saved, `remaining` is forced to zero, a 30-second cooldown is forced, and the scraper returns an empty result.
 - An advisory lock serializes rate-state coordination and FC2MADB requests across scraper processes.
 
 ## Test Methodology

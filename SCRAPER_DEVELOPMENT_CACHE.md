@@ -85,8 +85,8 @@ See `fc2madb/RATE_LIMIT_FINDINGS.md` for full details.
 - Laravel throttle: **limit=3, window=~1-1.5s**. No `X-RateLimit-Reset` or `Retry-After` headers ever.
 - 429 response has NO rate-limit headers. Inertia component is `"Error"`, version is `""`.
 - `remember_web` cookie is deleted on 429 (Max-Age=0). Session cookies are still refreshed.
-- The scraper uses a conservative 5-second heuristic cooldown when no reset header exists.
-- Every direct, fallback, deferred, retry, and FlareSolverr-represented origin response is recorded immediately; 429 always persists a forced cooldown.
+- The scraper uses a 30-second cooldown when remaining is 0, and a conservative 5-second heuristic for remaining 1 when no reset header exists.
+- Every direct, fallback, deferred, retry, and FlareSolverr-represented origin response is recorded immediately; 429 forces remaining to 0 and persists the 30-second cooldown.
 - An advisory lock serializes the rate-state/request sequence across scraper processes.
 
 ### fc2cmadb.com 404 behavior (verified 2026-07-17)
