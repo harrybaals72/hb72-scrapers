@@ -1,9 +1,0 @@
-id: fc2ppvdb-proxy
-name: fc2ppvdb-proxy
-metadata: {}
-version: 3c1f701
-date: "2025-01-25 18:29:12"
-requires: []
-# source_repository: https://stashapp.github.io/CommunityScrapers/stable/index.yml
-files:
-- fc2ppvdb-proxy.yml

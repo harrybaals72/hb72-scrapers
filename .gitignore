@@ -6,3 +6,4 @@ fc2madb/rate_state.json
 # Python bytecode.
 __pycache__/
 *.py[cod]
+.pi-subagents

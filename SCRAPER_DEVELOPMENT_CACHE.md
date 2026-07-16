@@ -36,15 +36,69 @@ rg -n "ScrapedScene|ScrapedTag" pkg/models
 
 ### Failure-mode disambiguation (general pattern)
 
-When a scraper cannot return a complete scene, it can return a scene containing only a sentinel tag and optionally the `code` and `details` fields. This makes the failure reason visible in the scrape dialog and Identify task instead of a silent empty result. Suggested pattern:
+When a scraper cannot return a complete scene, distinguish **terminal** from **transient** failures:
 
-- Return the scene's identifier (`code`) so it is not wiped by the scrape.
-- Use a distinctive tag name per failure mode (e.g. "Not Found", "Rate Limited", "Auth Error").
-- Include the HTTP status or exception message in `details` when available.
-- Log the failure reason with structured format (e.g. `FAILURE TYPE=<type>  URL=<url>`) for easy monitoring.
-- Distinguish terminal failures (e.g. 404 — scene will never match) from retryable ones (e.g. 429, auth expiry).
+**Terminal** (e.g. 404 — URL will never resolve): return `{"tags": [{"name": "FC2MADB 404"}]}` with the sentinel tag and **no** `code`, `details`, or `urls` metadata. The tag persists to indicate the URL is permanently unresolvable.
 
-For the Identify task, pre-create the sentinel tag so post-processing resolves it, or enable `createMissing` for tags in the source config.
+**Transient** (e.g. 429, auth expiry, cloudflare, network error — may succeed on retry): return `{}` (empty dict). No metadata or tags should persist from a failed scrape — the user can retry and a subsequent successful scrape will populate the scene cleanly.
+
+For all failures, log the reason with structured format (e.g. `FAILURE TYPE=<type>  URL=<url>`) for monitoring. The Identify task sees nothing for transient failures (no result to apply), so retries are not polluted by stale sentinel tags.
+
+For the Identify task, pre-create the sentinel tag for terminal-only failures so post-processing resolves it, or enable `createMissing` for tags in the source config.
+
+### Auth detection via Inertia page data
+
+The site embeds `auth.user` in the initial HTML page data (inside `<script data-page="app">`). When cookies are expired or invalid, `auth.user` is `null`. The scraper checks this after extracting the Inertia props — if `auth.user` is not a dict, the user is not logged in and the scraper returns `{}` with an error telling them to re-export cookies.
+
+This check happens BEFORE the Inertia JSON GET for actresses, so no fallback occurs for an unauthenticated session. The auth check covers both the initial-HTML path (props from HTML) and the Inertia JSON GET fallback (full page data from the fallback request).
+
+### Performer/actress retrieval (2 requests per scrape)
+
+The initial HTML page data includes `article` but **not** `actresses` — `actresses` is a **deferred Inertia prop** (`deferredProps: {'default': ['actresses']}`). To retrieve actresses, the scraper makes a second GET with Inertia partial-data headers (`X-Inertia-Partial-Component: Articles/Show`, `X-Inertia-Partial-Data: article,actresses`). This is done AFTER auth and article checks pass.
+
+Confirmed by testing articles 4604611 (has performer 早瀬未来) and 4940229 (no performer):
+- 4604611: Inertia GET returns 1 actress (早瀬未来)
+- 4940229: Inertia GET returns 0 actresses
+
+The version is extracted fresh from the initial HTML, so 409 (version mismatch) never occurs in practice.
+
+### Rate-limit state: saved on EVERY server-reaching request
+
+Every request that reaches the fc2cmadb server counts against the rate limit. The scraper saves rate state in ALL paths before returning, including:
+- Login page detection (direct GET and initial HTML)
+- Auth check failure (auth.user is null)
+- Article missing (not found)
+- 404 (terminal)
+- 429 (forced cooldown even without rate-limit headers)
+- Inertia fallback failures (login, non-200, parse error)
+- Inertia partial-data GET (headers captured before status-code checks)
+- Successful completion
+
+The only paths that skip rate-state saving are those where no origin request occurred: unsupported URL, missing cookies, or a direct network error with no FlareSolverr solution. Direct Cloudflare responses and FlareSolverr-represented origin responses are recorded.
+
+A normal scrape uses 2 origin requests (initial HTML GET + Inertia JSON GET). Empty-shell fallback, 409 retry, or Cloudflare recovery can require additional requests and each response is recorded immediately.
+
+### fc2cmadb.com rate-limit behavior (verified 2026-07-16)
+
+See `fc2madb/RATE_LIMIT_FINDINGS.md` for full details.
+
+- Laravel throttle: **limit=3, window=~1-1.5s**. No `X-RateLimit-Reset` or `Retry-After` headers ever.
+- 429 response has NO rate-limit headers. Inertia component is `"Error"`, version is `""`.
+- `remember_web` cookie is deleted on 429 (Max-Age=0). Session cookies are still refreshed.
+- The scraper uses a 30-second cooldown when remaining is 0, and a conservative 5-second heuristic for remaining 1 when no reset header exists.
+- Every direct, fallback, deferred, retry, and FlareSolverr-represented origin response is recorded immediately; 429 forces remaining to 0 and persists the 30-second cooldown.
+- An advisory lock serializes the rate-state/request sequence across scraper processes.
+
+### fc2cmadb.com 404 behavior (verified 2026-07-17)
+
+Source: `fc2madb/fc2madb.py` test request to `/articles/667478`.
+
+- A non-existent article returns **HTTP 404** with Inertia component `"Error"` (not `"Articles/Show"`).
+- The 404 HTML **does** contain Inertia page data with `props.status` (404) and `props.message` (e.g. "No query results for model [App\Models\Article]").
+- No `article` key exists in props — the scraper must detect the error component or check for `article` presence.
+- Rate-limit headers **are** sent (X-RateLimit-Remaining decrements). The 404 counts against the limit and the scraper **must** save rate-limit state before returning.
+- The Inertia JSON GET fallback also returns 404 with component `"Error"` and the same `props.status`/`props.message` in the JSON body.
+- 404 is terminal — return **only** the sentinel tag `"FC2MADB 404"` with no `code`, `details`, or `urls` metadata.
 
 ## Maintenance rules
 

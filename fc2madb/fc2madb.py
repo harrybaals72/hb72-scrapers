@@ -13,9 +13,12 @@ import os
 import re
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import urlparse
+
+import fcntl
 
 from py_common import log
 from py_common.types import ScrapedScene
@@ -131,6 +134,9 @@ def _new_session(solution: dict[str, Any] | None, cookies: dict[str, str]) -> re
     session.proxies = {}
     session.trust_env = False
 
+    for name, value in cookies.items():
+        _set_cookie(session, name, value, domain=f".{SITE_HOST}", path="/")
+
     if solution:
         user_agent = solution.get("userAgent")
         if user_agent:
@@ -145,9 +151,6 @@ def _new_session(solution: dict[str, Any] | None, cookies: dict[str, str]) -> re
                 domain=cookie.get("domain") or SITE_HOST,
                 path=cookie.get("path") or "/",
             )
-
-    for name, value in cookies.items():
-        _set_cookie(session, name, value, domain=f".{SITE_HOST}", path="/")
 
     return session
 
@@ -222,6 +225,7 @@ def _inertia_page_data(html: str) -> dict[str, Any] | None:
     return props if isinstance(props, dict) else None
 
 
+
 # ---------------------------------------------------------------------------
 # Rate-limit state persistence
 #
@@ -232,7 +236,8 @@ def _inertia_page_data(html: str) -> dict[str, Any] | None:
 
 
 _RATE_STATE_VERSION = 1
-_DEFAULT_WINDOW_SECONDS = 60
+_DEFAULT_WINDOW_SECONDS = 5
+_ZERO_REMAINING_COOLDOWN_SECONDS = 30
 
 
 def _load_rate_state() -> dict[str, Any]:
@@ -300,17 +305,29 @@ def _update_rate_state_from_headers(
     now = time.time()
 
     # Extract headers (case-insensitive lookup)
+    limit_str = ""
     remaining_str = ""
     reset_str = ""
     retry_str = ""
     for k, v in headers.items():
         k_lower = k.lower()
-        if k_lower == "x-ratelimit-remaining":
+        if k_lower == "x-ratelimit-limit":
+            limit_str = v
+        elif k_lower == "x-ratelimit-remaining":
             remaining_str = v
         elif k_lower == "x-ratelimit-reset":
             reset_str = v
         elif k_lower == "retry-after":
             retry_str = v
+
+    if limit_str:
+        try:
+            state["limit"] = int(limit_str)
+        except (TypeError, ValueError):
+            log.warning(
+                f"[fc2madb.py] Rate-limit header unparseable: "
+                f"X-RateLimit-Limit={limit_str!r}"
+            )
 
     if not remaining_str:
         log.info(
@@ -347,7 +364,12 @@ def _update_rate_state_from_headers(
         except (TypeError, ValueError):
             cooldown = 0.0
 
-    if cooldown <= 0 and remaining <= 1:
+    if remaining == 0:
+        # Zero remaining is an exhausted quota. Use the explicit safety
+        # cooldown even when the server supplies no reset/retry header.
+        cooldown = _ZERO_REMAINING_COOLDOWN_SECONDS
+        cooldown_source = "zero remaining"
+    elif cooldown <= 0 and remaining == 1:
         # No explicit reset time — use a heuristic: if the window started
         # recently, estimate the remaining window duration.
         elapsed = now - state.get("window_start", 0.0)
@@ -376,6 +398,71 @@ def _update_rate_state_from_headers(
             )
 
     return state
+
+
+def _force_rate_limit_cooldown(state: dict[str, Any]) -> None:
+    """Force the zero-remaining cooldown for a 429 without rate headers."""
+    now = time.time()
+    cooldown = _ZERO_REMAINING_COOLDOWN_SECONDS
+    state["remaining"] = 0
+    state["cooldown_until"] = now + cooldown
+    state["window_start"] = now
+
+
+def _record_response(state: dict[str, Any], response: Any) -> None:
+    """Persist rate state immediately after every origin response."""
+    _update_rate_state_from_headers(state, dict(getattr(response, "headers", {})))
+    if getattr(response, "status_code", 0) == 429:
+        _force_rate_limit_cooldown(state)
+    _save_rate_state(state)
+
+
+def _record_solution_response(
+    state: dict[str, Any], solution: dict[str, Any]
+) -> int | None:
+    """Persist headers/status carried by a FlareSolverr origin response.
+
+    FlareSolverr versions do not consistently include the origin status in a
+    solution.  ``None`` preserves that uncertainty so the Inertia props can
+    provide the authoritative status when available.
+    """
+    raw_status = solution.get("status")
+    if raw_status is None:
+        raw_status = solution.get("statusCode")
+    try:
+        status = int(raw_status) if raw_status is not None else None
+    except (TypeError, ValueError):
+        status = None
+    headers = solution.get("headers") if isinstance(solution.get("headers"), dict) else {}
+    _update_rate_state_from_headers(state, headers)
+    if status == 429:
+        _force_rate_limit_cooldown(state)
+    _save_rate_state(state)
+    return status
+
+
+@contextmanager
+def _rate_state_lock() -> Iterator[None]:
+    """Serialize rate-state coordination and all FC2MADB requests."""
+    lock_path = Path(f"{RATE_LIMIT_STATE_FILE}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _authenticated(props: Any) -> bool:
+    auth = props.get("auth") if isinstance(props, dict) else None
+    return isinstance(auth, dict) and isinstance(auth.get("user"), dict)
+
+
+def _error_message(props: Any, status: int) -> str:
+    if isinstance(props, dict) and props.get("message"):
+        return f"HTTP {status} - {props['message']}"
+    return f"HTTP {status}"
 
 
 def _article_id_from_value(value: Any) -> str:
@@ -440,193 +527,193 @@ def _duration_seconds(value: Any) -> int | None:
     return None
 
 
-def _failure_result(
-    tag_name: str,
-    *,
-    details: str = "",
-    url: str = "",
-) -> ScrapedScene:
-    """Return a scraped scene with a single sentinel tag and optional metadata.
-
-    Preserves the scene's FC2 code (extracted from *url*) so the code is not
-    wiped on failure.  *details* is appended to the code as a human-readable
-    suffix.
-    """
-    result: ScrapedScene = {
-        "tags": [{"name": tag_name}],
-    }
-
-    article_id = _article_id_from_url(url)
-    if article_id:
-        result["code"] = f"FC2-PPV-{article_id}"
-
-    if details:
-        result["details"] = details
-
-    if url:
-        result["urls"] = [url]
-
-    return result
-
-
-def scene_from_url(url: str) -> ScrapedScene:
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or parsed.hostname not in {
-        SITE_HOST,
-        f"www.{SITE_HOST}",
-    }:
-        log.error(f"[fc2madb.py] FAILURE TYPE=unsupported_url  URL={url}")
-        return _failure_result("FC2MADB: Parse Error", url=url)
-
-    cookies = _load_cookies()
-    if not cookies.get("fc2cmadb-session") or not cookies.get("XSRF-TOKEN"):
-        log.error(
-            f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  "
-            f"missing fc2cmadb-session or XSRF-TOKEN. "
-            f"Put a browser cookie export in {COOKIE_FILE} or set "
-            "FC2CMADB_SESSION and FC2CMADB_XSRF_TOKEN."
-        )
-        return _failure_result("FC2MADB: Auth Error", url=url)
-
-    # ---- Rate-limit: load state and wait if in cooldown ----
+def _scene_from_url_locked(url: str, cookies: dict[str, str]) -> ScrapedScene:
     rate_state = _load_rate_state()
     _wait_for_cooldown(rate_state)
-
-    solution = _get_flaresolverr_solution(url, cookies)
-    session = _new_session(solution, cookies)
-
-    # ---- Always try a direct GET ----
-    # The session has FlareSolverr's cookies and User-Agent when available,
-    # so it should bypass Cloudflare.  We use this request for BOTH the
-    # page body (Inertia parsing) and the response headers (rate-limit
-    # tracking).  Only fall back to the FlareSolverr solution body when the
-    # direct GET is blocked.
-    response_headers: dict[str, str] | None = None
+    session = _new_session(None, cookies)
     initial_html = ""
+    initial_status: int | None = 200
+    initial_props: dict[str, Any] | None = None
+    solution: dict[str, Any] | None = None
 
     try:
         initial = session.get(url, timeout=REQUEST_TIMEOUT)
-        if initial.status_code == 403 and "1005" in initial.text:
-            # Cloudflare block — use FlareSolverr solution body
+        _record_response(rate_state, initial)
+        initial_status = initial.status_code
+        if initial_status == 429:
+            log.error(f"[fc2madb.py] FAILURE TYPE=http_429  URL={url}  rate limit exceeded")
+            return {}
+        if _login_page(initial.text, initial.url):
+            log.error(f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  login prompt in direct fetch")
+            return {}
+        if initial_status == 403 and "1005" in initial.text:
+            solution = _get_flaresolverr_solution(url, cookies)
             if not solution:
                 log.error(
                     f"[fc2madb.py] FAILURE TYPE=cloudflare  URL={url}  "
                     "ASN block and no FlareSolverr fallback"
                 )
-                return _failure_result("FC2MADB: Cloudflare Blocked", url=url)
+                return {}
+            initial_status = _record_solution_response(rate_state, solution)
+            if initial_status == 429:
+                log.error(f"[fc2madb.py] FAILURE TYPE=http_429  URL={url}  rate limit exceeded")
+                return {}
             initial_html = str(solution.get("response", ""))
-            if isinstance(solution.get("headers"), dict):
-                response_headers = solution["headers"]
-        elif _login_page(initial.text, initial.url):
-            log.error(
-                f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  login prompt in direct fetch"
-            )
-            return _failure_result("FC2MADB: Auth Error", url=url)
+            session = _new_session(solution, cookies)
         else:
-            # Direct GET succeeded — use its body and headers
             initial_html = initial.text
-            response_headers = dict(initial.headers)
     except requests.RequestException as exc:
-        # Network error — use FlareSolverr solution body if available
-        if not solution:
-            log.error(f"[fc2madb.py] FAILURE TYPE=unreachable  URL={url}  {exc}")
-            return _failure_result("FC2MADB: Unreachable", details=str(exc), url=url)
-        initial_html = str(solution.get("response", ""))
-        if isinstance(solution.get("headers"), dict):
-            response_headers = solution["headers"]
+        # A timeout or connection error may occur after the request reached
+        # FC2MADB. Do not issue another origin request through FlareSolverr.
+        log.error(f"[fc2madb.py] FAILURE TYPE=unreachable  URL={url}  {exc}")
+        return {}
 
     if _login_page(initial_html):
-        log.error(
-            f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  "
-            "login prompt in initial response"
-        )
-        return _failure_result("FC2MADB: Auth Error", url=url)
+        log.error(f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  login prompt in initial response")
+        return {}
 
-    # ---- Parse Inertia page data from the initial HTML response ----
-    # The initial HTML (from FlareSolverr or direct GET) contains the full
-    # page data embedded in a <script data-page="app"> tag.  Extracting it
-    # directly avoids a second GET request, halving our request count and
-    # staying well within the site's aggressive X-RateLimit-Limit: 3 budget.
-    props = _inertia_page_data(initial_html)
-    if not props:
-        # Fallback: make an Inertia JSON GET if the initial HTML didn't
-        # contain parseable page data.
+    initial_props = _inertia_page_data(initial_html)
+    if initial_props is None and initial_status in (200, None):
+        # Some deployments return an empty shell to the direct request. Ask
+        # Inertia for the full page, then classify that response normally.
         version = _inertia_version(initial_html)
         if not version:
             log.error(
-                f"[fc2madb.py] FAILURE TYPE=parse_error  URL={url}  no Inertia version in HTML"
+                f"[fc2madb.py] FAILURE TYPE=parse_error  URL={url}  "
+                "no Inertia version in HTML"
             )
-            return _failure_result("FC2MADB: Parse Error", url=url)
-
-        session.headers.update(
-            {
-                "X-Inertia": "true",
-                "X-Requested-With": "XMLHttpRequest",
-                "X-Inertia-Partial-Component": "Articles/Show",
-                "X-Inertia-Partial-Data": "article,actresses",
-                "X-Inertia-Version": version,
-                "Referer": url,
-                "Accept": "text/html, application/xhtml+xml",
-                "Cache-Control": "no-cache",
-            }
-        )
-
+            return {}
+        headers = {
+            "X-Inertia": "true",
+            "X-Requested-With": "XMLHttpRequest",
+            "X-Inertia-Version": version,
+            "Referer": url,
+            "Accept": "text/html, application/xhtml+xml",
+            "Cache-Control": "no-cache",
+        }
         try:
-            info_response = session.get(url, timeout=REQUEST_TIMEOUT)
+            info_response = session.get(url, timeout=REQUEST_TIMEOUT, headers=headers)
+            _record_response(rate_state, info_response)
             if _login_page(info_response.text, info_response.url):
-                log.error(
-                    f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  Inertia GET redirected to login"
-                )
-                return _failure_result("FC2MADB: Auth Error", url=url)
-            if info_response.status_code != 200:
-                log.error(
-                    f"[fc2madb.py] FAILURE TYPE=http_{info_response.status_code}  URL={url}"
-                )
-                tag_name = (
-                    "FC2MADB: Not Found"
-                    if info_response.status_code == 404
-                    else "FC2MADB: Rate Limited"
-                    if info_response.status_code == 429
-                    else "FC2MADB: Unreachable"
-                )
-                return _failure_result(
-                    tag_name,
-                    details=f"HTTP {info_response.status_code}",
-                    url=url,
-                )
-            payload = info_response.json()
-            props = payload.get("props", {}) if isinstance(payload, dict) else {}
-            if response_headers is None:
-                response_headers = dict(info_response.headers)
-        except (requests.RequestException, ValueError) as exc:
-            log.error(f"[fc2madb.py] FAILURE TYPE=parse_error  URL={url}  {exc}")
-            return _failure_result("FC2MADB: Parse Error", details=str(exc), url=url)
+                log.error(f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  Inertia GET redirected to login")
+                return {}
+            if info_response.status_code == 429:
+                log.error(f"[fc2madb.py] FAILURE TYPE=http_429  URL={url}  rate limit exceeded")
+                return {}
+            try:
+                payload = info_response.json()
+            except ValueError as exc:
+                log.error(f"[fc2madb.py] FAILURE TYPE=parse_error  URL={url}  {exc}")
+                return {}
+            initial_status = info_response.status_code
+            initial_props = payload.get("props") if isinstance(payload, dict) else None
+            if not isinstance(initial_props, dict):
+                log.error(f"[fc2madb.py] FAILURE TYPE=parse_error  URL={url}  invalid Inertia props")
+                return {}
+        except requests.RequestException as exc:
+            log.error(f"[fc2madb.py] FAILURE TYPE=unreachable  URL={url}  {exc}")
+            return {}
 
-    # ---- Update rate-limit state from response headers ----
-    if response_headers:
-        _update_rate_state_from_headers(rate_state, response_headers)
-        _save_rate_state(rate_state)
-    else:
-        log.warning(
-            f"[fc2madb.py] No rate-limit headers found in response for {url} — "
-            "throttling will not be applied for subsequent scrapes"
+    # FlareSolverr may omit the origin status. In that case, use the
+    # authenticated Inertia props (especially props.status for error pages).
+    if initial_status is None:
+        raw_status = initial_props.get("status") if isinstance(initial_props, dict) else None
+        try:
+            initial_status = int(raw_status) if raw_status is not None else 200
+        except (TypeError, ValueError):
+            initial_status = 200
+
+    # Auth is deliberately checked before interpreting a 404. An error page
+    # without auth data cannot prove that the supplied session is logged in.
+    if not _authenticated(initial_props):
+        log.error(
+            f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  "
+            "cookies are expired or invalid — user is not logged in"
         )
-    article = props.get("article") if isinstance(props, dict) else None
+        return {}
+
+    if initial_status == 404:
+        log.error(
+            f"[fc2madb.py] FAILURE TYPE=http_404  URL={url}  "
+            f"{_error_message(initial_props, initial_status)}"
+        )
+        return {"tags": [{"name": "FC2MADB 404"}]}
+    if initial_status != 200:
+        log.error(
+            f"[fc2madb.py] FAILURE TYPE=http_{initial_status}  URL={url}  "
+            f"{_error_message(initial_props, initial_status)}"
+        )
+        return {}
+
+    article = initial_props.get("article")
     if not isinstance(article, dict):
-        log.error(f"[fc2madb.py] FAILURE TYPE=not_found  URL={url}  article object missing")
-        return _failure_result("FC2MADB: Not Found", url=url)
+        log.error(f"[fc2madb.py] FAILURE TYPE=parse_error  URL={url}  article object missing")
+        return {}
+
+    version = _inertia_version(initial_html)
+    if not version:
+        log.error(f"[fc2madb.py] FAILURE TYPE=parse_error  URL={url}  no Inertia version in HTML")
+        return {}
+
+    # actresses is a deferred Inertia prop. A complete scrape requires this
+    # second successful request, even when the returned list is empty.
+    inertia_headers = {
+        "X-Inertia": "true",
+        "X-Requested-With": "XMLHttpRequest",
+        "X-Inertia-Partial-Component": "Articles/Show",
+        "X-Inertia-Partial-Data": "article,actresses",
+        "X-Inertia-Version": version,
+        "Referer": url,
+        "Accept": "application/json, text/plain, */*",
+    }
+    try:
+        info_response = session.get(url, timeout=REQUEST_TIMEOUT, headers=inertia_headers)
+        _record_response(rate_state, info_response)
+        if _login_page(info_response.text, info_response.url):
+            log.error(f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  deferred GET redirected to login")
+            return {}
+        if info_response.status_code == 429:
+            log.error(f"[fc2madb.py] FAILURE TYPE=http_429  URL={url}  rate limit exceeded")
+            return {}
+        if info_response.status_code == 409:
+            new_version = _inertia_version(info_response.text)
+            if not new_version or new_version == version:
+                log.error(f"[fc2madb.py] FAILURE TYPE=http_409  URL={url}  version mismatch")
+                return {}
+            inertia_headers["X-Inertia-Version"] = new_version
+            retry = session.get(url, timeout=REQUEST_TIMEOUT, headers=inertia_headers)
+            _record_response(rate_state, retry)
+            if _login_page(retry.text, retry.url) or retry.status_code != 200:
+                log.error(f"[fc2madb.py] FAILURE TYPE=http_{retry.status_code}  URL={url}  deferred retry failed")
+                return {}
+            info_response = retry
+        if info_response.status_code != 200:
+            log.error(
+                f"[fc2madb.py] FAILURE TYPE=http_{info_response.status_code}  URL={url}  "
+                "deferred actresses request failed"
+            )
+            return {}
+        payload = info_response.json()
+    except (requests.RequestException, ValueError) as exc:
+        log.error(f"[fc2madb.py] FAILURE TYPE=performers  URL={url}  {exc}")
+        return {}
+
+    if not isinstance(payload, dict) or payload.get("component") != "Articles/Show":
+        log.error(f"[fc2madb.py] FAILURE TYPE=parse_error  URL={url}  unexpected Inertia component")
+        return {}
+    deferred_props = payload.get("props")
+    actresses = deferred_props.get("actresses") if isinstance(deferred_props, dict) else None
+    if not isinstance(actresses, list):
+        log.error(f"[fc2madb.py] FAILURE TYPE=parse_error  URL={url}  actresses list missing")
+        return {}
 
     scene: ScrapedScene = {}
     title = str(article.get("title") or "").strip()
-    # Title goes into details, not the scene title
     description = str(article.get("description") or article.get("details") or "").strip()
-    if title:
-        if description:
-            scene["details"] = f"{title}\n{description}"
-        else:
-            scene["details"] = title
-    elif description:
-        scene["details"] = description
+    if title and description:
+        scene["details"] = f"{title}\n{description}"
+    elif title or description:
+        scene["details"] = title or description
 
     video_id = article.get("video_id")
     if video_id:
@@ -649,17 +736,33 @@ def scene_from_url(url: str) -> ScrapedScene:
             for tag in tags
             if isinstance(tag, dict) and tag.get("name")
         ]
-
-    actresses = props.get("actresses")
-    if isinstance(actresses, list):
-        scene["performers"] = [
-            {"name": str(performer["name"]).strip()}
-            for performer in actresses
-            if isinstance(performer, dict) and performer.get("name")
-        ]
-
+    scene["performers"] = [
+        {"name": str(performer["name"]).strip()}
+        for performer in actresses
+        if isinstance(performer, dict) and performer.get("name")
+    ]
     scene["urls"] = [url]
     return scene
+
+
+def scene_from_url(url: str) -> ScrapedScene:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or parsed.hostname not in {
+        SITE_HOST,
+        f"www.{SITE_HOST}",
+    }:
+        log.error(f"[fc2madb.py] FAILURE TYPE=unsupported_url  URL={url}")
+        return {}
+
+    cookies = _load_cookies()
+    if not cookies.get("fc2cmadb-session") or not cookies.get("XSRF-TOKEN"):
+        log.error(
+            f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  missing session cookies. "
+            f"Put a browser cookie export in {COOKIE_FILE}."
+        )
+        return {}
+    with _rate_state_lock():
+        return _scene_from_url_locked(url, cookies)
 
 
 if __name__ == "__main__":
