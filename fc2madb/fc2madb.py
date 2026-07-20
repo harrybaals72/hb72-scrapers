@@ -384,6 +384,7 @@ def _save_rate_state(state: dict[str, Any]) -> None:
     """Atomically write rate-limit state to ``RATE_LIMIT_STATE_FILE``."""
     path = Path(RATE_LIMIT_STATE_FILE)
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
         tmp.write_text(
             json.dumps(state, ensure_ascii=False, sort_keys=True),

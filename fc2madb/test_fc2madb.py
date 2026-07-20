@@ -190,6 +190,48 @@ class ScraperTests(unittest.TestCase):
         self.assertEqual(saved["user_agent"], "saved-agent")
         self.assertEqual(saved["cookies"]["fc2cmadb-session"], "session-secret")
 
+    def test_load_saved_session_returns_none_when_file_missing(self):
+        self.assertIsNone(fc2madb._load_saved_session())
+
+    def test_load_saved_session_returns_none_on_corrupt_file(self):
+        Path(self.session_file).write_text("not json", encoding="utf-8")
+        self.assertIsNone(fc2madb._load_saved_session())
+
+    def test_load_saved_session_returns_none_on_empty_cookies(self):
+        Path(self.session_file).write_text(
+            json.dumps({"version": fc2madb._AUTH_SESSION_VERSION, "cookies": {}}),
+            encoding="utf-8",
+        )
+        self.assertIsNone(fc2madb._load_saved_session())
+
+    def test_save_session_returns_false_when_session_has_no_cookies(self):
+        session = requests.Session()
+        self.assertFalse(fc2madb._save_session(session))
+
+    def test_save_session_creates_parent_directory(self):
+        # Use a nested path where the parent dir does not exist
+        nested = str(Path(self.tempdir.name) / "nested" / "auth_session.json")
+        session = requests.Session()
+        session.cookies.set(
+            "fc2cmadb-session", "secret", domain="fc2cmadb.com", path="/"
+        )
+        with patch.object(fc2madb, "AUTH_SESSION_FILE", nested):
+            self.assertTrue(fc2madb._save_session(session))
+            self.assertTrue(Path(nested).is_file())
+
+    def test_save_rate_state_creates_parent_directory(self):
+        nested = str(Path(self.tempdir.name) / "nested" / "rate_state.json")
+        state = {"version": 1, "remaining": 3, "cooldown_until": 0.0, "window_start": 0.0}
+        with patch.object(fc2madb, "RATE_LIMIT_STATE_FILE", nested):
+            fc2madb._save_rate_state(state)
+            self.assertTrue(Path(nested).is_file())
+
+    def test_load_rate_state_returns_default_when_file_missing(self):
+        missing = str(Path(self.tempdir.name) / "nonexistent.json")
+        with patch.object(fc2madb, "RATE_LIMIT_STATE_FILE", missing):
+            state = fc2madb._load_rate_state()
+        self.assertEqual(state["remaining"], 3)
+
     def test_login_cookie_canonicalization_prefers_response_values(self):
         session = requests.Session()
         session.cookies.set(
