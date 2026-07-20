@@ -4,8 +4,8 @@ metadata: {}
 version: 1.0.0
 date: "2026-07-15 19:25:54"
 requires: []
-# The cookie export is intentionally not packaged. Copy cookies.json next to
-# fc2madb.py or configure FC2CMADB_COOKIE_FILE/FC2CMADB_* environment variables.
+# config.ini contains credentials and is intentionally not packaged. Create it
+# beside fc2madb.py with fc2cmadb_email and fc2cmadb_password.
 files:
 - README.md
 - fc2madb.yml

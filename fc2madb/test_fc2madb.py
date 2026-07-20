@@ -73,11 +73,16 @@ class FakeCookies:
     def set(self, name, value, **kwargs):
         self.values[name] = value
 
+    def __iter__(self):
+        return iter(())
+
 
 class FakeSession:
-    def __init__(self, responses):
+    def __init__(self, responses, post_responses=None):
         self.responses = list(responses)
+        self.post_responses = list(post_responses or [])
         self.calls = []
+        self.post_calls = []
         self.headers = {}
         self.cookies = FakeCookies()
 
@@ -86,6 +91,15 @@ class FakeSession:
         if not self.responses:
             raise AssertionError("unexpected request")
         response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+    def post(self, url, **kwargs):
+        self.post_calls.append((url, kwargs))
+        if not self.post_responses:
+            raise AssertionError("unexpected POST")
+        response = self.post_responses.pop(0)
         if isinstance(response, BaseException):
             raise response
         return response
@@ -103,12 +117,75 @@ class ScraperTests(unittest.TestCase):
     def run_scrape(self, responses):
         session = FakeSession(responses)
         with patch.object(fc2madb, "RATE_LIMIT_STATE_FILE", self.rate_file), patch.object(
-            fc2madb, "_load_cookies", return_value=self.cookies
-        ), patch.object(fc2madb.requests, "Session", return_value=session), patch.object(
+            fc2madb, "_credentials", return_value=("email", "password")
+        ), patch.object(fc2madb, "_login_with_credentials", return_value=session), patch.object(
+            fc2madb.requests, "Session", return_value=session
+        ), patch.object(
             fc2madb, "_get_flaresolverr_solution", side_effect=AssertionError("FlareSolverr should not run")
         ):
             result = fc2madb.scene_from_url(URL)
         return result, session
+
+    def test_credential_login_uses_turnstile_solution_for_direct_https_post(self):
+        warm_solution = {
+            "headers": {"X-RateLimit-Limit": "3", "X-RateLimit-Remaining": "2"},
+        }
+        solved_solution = {
+            "headers": {"X-RateLimit-Limit": "3", "X-RateLimit-Remaining": "2"},
+            "userAgent": "FlareSolverr test agent",
+            "turnstile_token": "test-turnstile-token",
+            "cookies": [{"name": "XSRF-TOKEN", "value": "encoded%3Dtoken"}],
+        }
+        login_response = FakeResponse(
+            status_code=409,
+            headers={"X-Inertia-Location": "https://fc2cmadb.com"},
+        )
+        session = FakeSession([], [login_response])
+        commands = [
+            {"status": "ok"},
+            {"status": "ok", "solution": warm_solution},
+            {"status": "ok", "solution": solved_solution},
+            {"status": "ok"},
+        ]
+        with patch.object(fc2madb, "_flaresolverr_command", side_effect=commands) as command, patch.object(
+            fc2madb, "_new_session", return_value=session
+        ), patch.object(fc2madb.time, "sleep"), patch.object(
+            fc2madb, "RATE_LIMIT_STATE_FILE", self.rate_file
+        ):
+            result = fc2madb._login_with_credentials({}, "email", "password")
+        self.assertIs(result, session)
+        self.assertEqual(len(session.post_calls), 1)
+        post_url, post_kwargs = session.post_calls[0]
+        self.assertEqual(post_url, fc2madb.LOGIN_URL)
+        self.assertEqual(
+            post_kwargs["json"],
+            {
+                "email": "email",
+                "password": "password",
+                "remember": True,
+                "token": "test-turnstile-token",
+            },
+        )
+        self.assertEqual(session.headers["X-XSRF-TOKEN"], "encoded=token")
+        self.assertEqual(command.call_args_list[-1].args[0]["cmd"], "sessions.destroy")
+
+    def test_login_success_rejects_redirect_back_to_login(self):
+        self.assertFalse(
+            fc2madb._login_succeeded(
+                FakeResponse(status_code=302, headers={"Location": fc2madb.LOGIN_URL})
+            )
+        )
+        self.assertTrue(
+            fc2madb._login_succeeded(
+                FakeResponse(status_code=302, headers={"Location": "/dashboard"})
+            )
+        )
+
+    def test_missing_credentials_never_contacts_login_services(self):
+        with patch.object(fc2madb, "_credentials", return_value=("", "")), patch.object(
+            fc2madb, "_login_with_credentials", side_effect=AssertionError("login should not run")
+        ):
+            self.assertEqual(fc2madb.scene_from_url(URL), {})
 
     def test_normal_success_requires_two_origin_gets_and_keeps_title_in_details(self):
         deferred = {
@@ -182,8 +259,10 @@ class ScraperTests(unittest.TestCase):
         }
         session = FakeSession([FakeResponse(status_code=403, text="Cloudflare 1005")])
         with patch.object(fc2madb, "RATE_LIMIT_STATE_FILE", self.rate_file), patch.object(
-            fc2madb, "_load_cookies", return_value=self.cookies
-        ), patch.object(fc2madb.requests, "Session", return_value=session), patch.object(
+            fc2madb, "_credentials", return_value=("email", "password")
+        ), patch.object(fc2madb, "_login_with_credentials", return_value=session), patch.object(
+            fc2madb.requests, "Session", return_value=session
+        ), patch.object(
             fc2madb, "_get_flaresolverr_solution", return_value=solution
         ):
             result = fc2madb.scene_from_url(URL)
@@ -200,8 +279,10 @@ class ScraperTests(unittest.TestCase):
         }
         session = FakeSession([FakeResponse(status_code=403, text="Cloudflare 1005")])
         with patch.object(fc2madb, "RATE_LIMIT_STATE_FILE", self.rate_file), patch.object(
-            fc2madb, "_load_cookies", return_value=self.cookies
-        ), patch.object(fc2madb.requests, "Session", return_value=session), patch.object(
+            fc2madb, "_credentials", return_value=("email", "password")
+        ), patch.object(fc2madb, "_login_with_credentials", return_value=session), patch.object(
+            fc2madb.requests, "Session", return_value=session
+        ), patch.object(
             fc2madb, "_get_flaresolverr_solution", return_value=solution
         ):
             result = fc2madb.scene_from_url(URL)

@@ -62,6 +62,16 @@ Confirmed by testing articles 4604611 (has performer 早瀬未来) and 4940229 (
 
 The version is extracted fresh from the initial HTML, so 409 (version mismatch) never occurs in practice.
 
+### Credential login (Turnstile required)
+
+Source: `fc2madb/LOGIN_FEASIBILITY.md`, `fc2madb/fc2madb.py`
+
+The login page (`/login`, component `Auth/Login`) submits `email`, `password`, `remember`, and a Turnstile `token`; Inertia/Axios supplies CSRF through the `XSRF-TOKEN` cookie and `X-XSRF-TOKEN` header. The production site key is `0x4AAAAAADXOhIQVuvaNOgcG`. The hidden `cf-turnstile-response` input is inserted into the rendered DOM, not the raw server HTML.
+
+FlareSolverr PR #1634 was merged into `master` and is included in official v3.5.0, including the running instance at `9.9.9.200:8191`. Because its selector check races the dynamically rendered input, the scraper warms a persistent FlareSolverr session, then calls `request.get` on a hash-only login URL with `tabs_till_verify: 8`. It uses the returned token, cookies, and user agent for a direct HTTPS Inertia credential POST; FlareSolverr `request.post` is not the login path.
+
+`fc2madb.py` reads `fc2cmadb_email` and `fc2cmadb_password` from its ignored `config.ini`, never reads a browser cookie export, and destroys the FlareSolverr session after the credential POST. It records the login responses in the existing rate-limit state, honors the resulting cooldown before article requests, and retains the existing authenticated-props and 429 checks.
+
 ### Rate-limit state: saved on EVERY server-reaching request
 
 Every request that reaches the fc2cmadb server counts against the rate limit. The scraper saves rate state in ALL paths before returning, including:

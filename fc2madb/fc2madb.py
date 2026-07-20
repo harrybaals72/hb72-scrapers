@@ -1,9 +1,9 @@
 """Stash scene scraper for fc2cmadb.com.
 
-The site is a Laravel/Inertia application protected by Cloudflare.  A browser
-cookie export can be placed next to this script as ``cookies.json``.  The
-FlareSolverr URL and cookie file can also be overridden with environment
-variables, which is useful when Stash and FlareSolverr run in containers.
+The site is a Laravel/Inertia application protected by Cloudflare Turnstile.
+Credentials are read from the local ``config.ini`` managed by ``py_common``;
+the scraper uses FlareSolverr to obtain a Turnstile token, then logs in via
+HTTPS before scraping. Browser cookie exports are not required.
 """
 
 from __future__ import annotations
@@ -11,12 +11,13 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import fcntl
 
@@ -33,27 +34,28 @@ SITE_HOST = "fc2cmadb.com"
 FLARESOLVERR_URL = os.environ.get(
     "FLARESOLVERR_URL", "http://9.9.9.200:8191/v1"
 )
-COOKIE_FILE = os.environ.get(
-    "FC2CMADB_COOKIE_FILE", str(Path(__file__).with_name("cookies.json"))
-)
+LOGIN_URL = f"https://{SITE_HOST}/login"
 REQUEST_TIMEOUT = float(os.environ.get("FC2CMADB_TIMEOUT", "30"))
+FLARESOLVERR_TIMEOUT_MS = int(os.environ.get("FC2CMADB_FLARESOLVERR_TIMEOUT_MS", "90000"))
+TURNSTILE_WIDGET_WAIT_SECONDS = float(
+    os.environ.get("FC2CMADB_TURNSTILE_WIDGET_WAIT_SECONDS", "2")
+)
+TURNSTILE_TAB_COUNT = int(os.environ.get("FC2CMADB_TURNSTILE_TAB_COUNT", "8"))
 RATE_LIMIT_STATE_FILE = os.environ.get(
     "FC2CMADB_RATE_STATE_FILE", str(Path(__file__).with_name("rate_state.json"))
 )
 ARTICLE_ID_RE = re.compile(r"(?<!\d)(\d{5,})(?!\d)")
 
-# These are only fallback names for py_common's optional config.ini.  The
-# browser export is preferred so that the supplied cookies.json works without
-# any manual copy/paste into another configuration file.
+# py_common manages a local config.ini next to the scraper. Do not log these
+# values: they are long-lived account credentials.
 try:
     from py_common.config import get_config
 
     _config = get_config(
         default="""
-# Optional fallback values. Browser cookies.json or environment variables are preferred.
-fc2cmadb_session =
-xsrf_token =
-age_verified = true
+# FC2MADB login credentials. Keep this file private.
+fc2cmadb_email =
+fc2cmadb_password =
 """
     )
 except Exception:
@@ -73,48 +75,19 @@ def _config_value(*names: str) -> str:
     return ""
 
 
-def _load_cookies() -> dict[str, str]:
-    """Load browser-exported cookies and apply optional config/env overrides."""
-    values: dict[str, str] = {}
-    cookie_path = Path(COOKIE_FILE)
-
-    if cookie_path.is_file():
-        try:
-            raw = json.loads(cookie_path.read_text(encoding="utf-8"))
-            records = raw.get("cookies", []) if isinstance(raw, dict) else raw
-            if isinstance(records, list):
-                for record in records:
-                    if isinstance(record, dict) and record.get("name") and record.get(
-                        "value"
-                    ) is not None:
-                        values[str(record["name"])] = str(record["value"])
-        except (OSError, json.JSONDecodeError) as exc:
-            log.warning(f"Unable to read cookie file {cookie_path}: {exc}")
-    else:
-        log.debug(f"Cookie file not found: {cookie_path}")
-
-    # Support the old py_common config names as a fallback, without logging
-    # their values. Environment variables are useful for container secrets.
-    values.setdefault("fc2cmadb-session", _config_value("fc2cmadb_session"))
-    values.setdefault("XSRF-TOKEN", _config_value("xsrf_token"))
-    values.setdefault("ageVerified", _config_value("age_verified") or "true")
-
-    overrides = {
-        "fc2cmadb-session": os.environ.get("FC2CMADB_SESSION", ""),
-        "XSRF-TOKEN": os.environ.get("FC2CMADB_XSRF_TOKEN", ""),
-        "ageVerified": os.environ.get("FC2CMADB_AGE_VERIFIED", ""),
-    }
-    for name, value in overrides.items():
-        if value:
-            values[name] = value
-
-    return {name: value for name, value in values.items() if value}
+def _credentials() -> tuple[str, str]:
+    """Return configured credentials without ever logging their values."""
+    return (
+        _config_value("fc2cmadb_email"),
+        _config_value("fc2cmadb_password"),
+    )
 
 
 def _cookie_payload(cookies: dict[str, str]) -> list[dict[str, str]]:
     return [
         {"name": name, "value": value, "domain": SITE_HOST, "path": "/"}
         for name, value in cookies.items()
+        if value
     ]
 
 
@@ -127,14 +100,15 @@ def _set_cookie(session: requests.Session, name: str, value: str, **kwargs: Any)
         session.cookies.set(name, value)
 
 
-def _new_session(solution: dict[str, Any] | None, cookies: dict[str, str]) -> requests.Session:
+def _new_session(solution: dict[str, Any] | None, cookies: dict[str, str] | None = None) -> requests.Session:
+    """Build a direct HTTPS session from a FlareSolverr solution."""
     session = requests.Session()
     # Direct connections avoid accidentally routing fc2cmadb through a proxy
     # that may expose or alter the authenticated request.
     session.proxies = {}
     session.trust_env = False
 
-    for name, value in cookies.items():
+    for name, value in (cookies or {}).items():
         _set_cookie(session, name, value, domain=f".{SITE_HOST}", path="/")
 
     if solution:
@@ -155,37 +129,49 @@ def _new_session(solution: dict[str, Any] | None, cookies: dict[str, str]) -> re
     return session
 
 
-def _get_flaresolverr_solution(url: str, cookies: dict[str, str]) -> dict[str, Any] | None:
-    """Return a FlareSolverr solution, or None when it is unavailable."""
+def _session_cookies(session: requests.Session) -> dict[str, str]:
+    """Return the current session cookies for FlareSolverr recovery."""
+    return {str(cookie.name): str(cookie.value) for cookie in session.cookies}
+
+
+def _flaresolverr_command(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Issue one FlareSolverr command without exposing sensitive response data."""
     try:
         response = requests.post(
             FLARESOLVERR_URL,
-            json={
-                "cmd": "request.get",
-                "url": url,
-                "cookies": _cookie_payload(cookies),
-                "session_ttl_minutes": 5,
-            },
-            timeout=REQUEST_TIMEOUT,
+            json=payload,
+            timeout=max(REQUEST_TIMEOUT, FLARESOLVERR_TIMEOUT_MS / 1000),
         )
     except requests.RequestException as exc:
         log.warning(f"Unable to contact FlareSolverr at {FLARESOLVERR_URL}: {exc}")
         return None
-
     if response.status_code != 200:
-        log.warning(
-            f"FlareSolverr returned HTTP {response.status_code} for {url}; trying a direct request"
-        )
+        log.warning(f"FlareSolverr returned HTTP {response.status_code}")
         return None
-
     try:
         body = response.json()
     except ValueError:
-        log.warning(f"FlareSolverr returned invalid JSON for {url}; trying a direct request")
+        log.warning("FlareSolverr returned invalid JSON")
         return None
+    if not isinstance(body, dict) or body.get("status") not in (None, "ok"):
+        log.warning(f"FlareSolverr command failed: {body.get('message', 'unknown error') if isinstance(body, dict) else 'invalid response'}")
+        return None
+    return body
 
-    if body.get("status") not in (None, "ok") or not isinstance(body.get("solution"), dict):
-        log.warning(f"FlareSolverr did not return a usable solution for {url}: {body.get('message', 'unknown error')}")
+
+def _get_flaresolverr_solution(url: str, cookies: dict[str, str]) -> dict[str, Any] | None:
+    """Return a FlareSolverr GET solution, or None when it is unavailable."""
+    body = _flaresolverr_command(
+        {
+            "cmd": "request.get",
+            "url": url,
+            "cookies": _cookie_payload(cookies),
+            "session_ttl_minutes": 5,
+            "maxTimeout": FLARESOLVERR_TIMEOUT_MS,
+        }
+    )
+    if not body or not isinstance(body.get("solution"), dict):
+        log.warning(f"FlareSolverr did not return a usable solution for {url}")
         return None
     return body["solution"]
 
@@ -454,6 +440,134 @@ def _rate_state_lock() -> Iterator[None]:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
+def _solution_cookie_value(solution: dict[str, Any], name: str) -> str:
+    """Return a named FlareSolverr cookie value without logging it."""
+    for cookie in solution.get("cookies", []):
+        if isinstance(cookie, dict) and cookie.get("name") == name:
+            return str(cookie.get("value") or "")
+    return ""
+
+
+def _login_succeeded(response: requests.Response) -> bool:
+    """Recognize Laravel/Inertia's successful external redirect response."""
+    if response.status_code in (302, 303):
+        location = str(response.headers.get("Location") or "")
+        return bool(location) and not urlparse(location).path.startswith("/login")
+    location = str(response.headers.get("X-Inertia-Location") or "")
+    return response.status_code == 409 and location.startswith(f"https://{SITE_HOST}")
+
+
+def _login_with_credentials(
+    rate_state: dict[str, Any], email: str, password: str
+) -> requests.Session | None:
+    """Solve Turnstile through FlareSolverr and return an authenticated session.
+
+    The FlareSolverr browser is used only for the dynamically rendered
+    Turnstile widget. Credentials are posted directly to fc2cmadb over HTTPS.
+    Every solution or direct response that represents an origin request is
+    recorded before another request is attempted.
+    """
+    flaresolverr_session = f"fc2madb-{secrets.token_hex(12)}"
+    created = False
+    try:
+        created_response = _flaresolverr_command(
+            {"cmd": "sessions.create", "session": flaresolverr_session}
+        )
+        if not created_response:
+            return None
+        created = True
+
+        warm_response = _flaresolverr_command(
+            {
+                "cmd": "request.get",
+                "url": LOGIN_URL,
+                "session": flaresolverr_session,
+                "maxTimeout": FLARESOLVERR_TIMEOUT_MS,
+                "waitInSeconds": 1,
+            }
+        )
+        warm_solution = warm_response.get("solution") if warm_response else None
+        if not isinstance(warm_solution, dict):
+            log.error("[fc2madb.py] FAILURE TYPE=login  FlareSolverr did not render the login page")
+            return None
+        if _record_solution_response(rate_state, warm_solution) == 429:
+            log.error("[fc2madb.py] FAILURE TYPE=http_429  login page rate limit exceeded")
+            return None
+
+        # The site inserts the Turnstile response input after React/Inertia
+        # initializes. Keep the same browser page and use only a hash change
+        # so FlareSolverr's immediate selector check can see that input.
+        time.sleep(TURNSTILE_WIDGET_WAIT_SECONDS)
+        solved_response = _flaresolverr_command(
+            {
+                "cmd": "request.get",
+                "url": f"{LOGIN_URL}#flaresolverr-turnstile",
+                "session": flaresolverr_session,
+                "tabs_till_verify": TURNSTILE_TAB_COUNT,
+                "maxTimeout": FLARESOLVERR_TIMEOUT_MS,
+                "waitInSeconds": 1,
+            }
+        )
+        solution = solved_response.get("solution") if solved_response else None
+        if not isinstance(solution, dict):
+            log.error("[fc2madb.py] FAILURE TYPE=login  FlareSolverr did not solve Turnstile")
+            return None
+        if _record_solution_response(rate_state, solution) == 429:
+            log.error("[fc2madb.py] FAILURE TYPE=http_429  Turnstile request rate limit exceeded")
+            return None
+
+        token = str(solution.get("turnstile_token") or "")
+        xsrf_token = _solution_cookie_value(solution, "XSRF-TOKEN")
+        if not token or not xsrf_token:
+            log.error("[fc2madb.py] FAILURE TYPE=login  Turnstile token or XSRF cookie missing")
+            return None
+
+        # Honor any server-provided or heuristic cooldown before the direct
+        # credential POST. This prevents login plus article retrieval from
+        # exceeding the site's three-request throttle window.
+        _wait_for_cooldown(rate_state)
+        session = _new_session(solution)
+        session.headers.update(
+            {
+                "Accept": "application/json, text/plain, */*",
+                "Referer": LOGIN_URL,
+                "X-Inertia": "true",
+                "X-Requested-With": "XMLHttpRequest",
+                "X-XSRF-TOKEN": unquote(xsrf_token),
+            }
+        )
+        try:
+            response = session.post(
+                LOGIN_URL,
+                json={
+                    "email": email,
+                    "password": password,
+                    "remember": True,
+                    "token": token,
+                },
+                timeout=REQUEST_TIMEOUT,
+                allow_redirects=False,
+            )
+        except requests.RequestException as exc:
+            log.error(f"[fc2madb.py] FAILURE TYPE=login  credential request failed: {exc}")
+            return None
+        _record_response(rate_state, response)
+        if response.status_code == 429:
+            log.error("[fc2madb.py] FAILURE TYPE=http_429  login request rate limit exceeded")
+            return None
+        if not _login_succeeded(response):
+            log.error(
+                f"[fc2madb.py] FAILURE TYPE=login  credential request returned HTTP {response.status_code}"
+            )
+            return None
+        return session
+    finally:
+        if created:
+            _flaresolverr_command(
+                {"cmd": "sessions.destroy", "session": flaresolverr_session}
+            )
+
+
 def _authenticated(props: Any) -> bool:
     auth = props.get("auth") if isinstance(props, dict) else None
     return isinstance(auth, dict) and isinstance(auth.get("user"), dict)
@@ -527,10 +641,15 @@ def _duration_seconds(value: Any) -> int | None:
     return None
 
 
-def _scene_from_url_locked(url: str, cookies: dict[str, str]) -> ScrapedScene:
+def _scene_from_url_locked(url: str, email: str, password: str) -> ScrapedScene:
     rate_state = _load_rate_state()
     _wait_for_cooldown(rate_state)
-    session = _new_session(None, cookies)
+    session = _login_with_credentials(rate_state, email, password)
+    if session is None:
+        return {}
+    # A successful login commonly leaves one request in the throttle window.
+    # Wait before the article GET so login and scraping cannot trigger a 429.
+    _wait_for_cooldown(rate_state)
     initial_html = ""
     initial_status: int | None = 200
     initial_props: dict[str, Any] | None = None
@@ -547,7 +666,7 @@ def _scene_from_url_locked(url: str, cookies: dict[str, str]) -> ScrapedScene:
             log.error(f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  login prompt in direct fetch")
             return {}
         if initial_status == 403 and "1005" in initial.text:
-            solution = _get_flaresolverr_solution(url, cookies)
+            solution = _get_flaresolverr_solution(url, _session_cookies(session))
             if not solution:
                 log.error(
                     f"[fc2madb.py] FAILURE TYPE=cloudflare  URL={url}  "
@@ -559,7 +678,7 @@ def _scene_from_url_locked(url: str, cookies: dict[str, str]) -> ScrapedScene:
                 log.error(f"[fc2madb.py] FAILURE TYPE=http_429  URL={url}  rate limit exceeded")
                 return {}
             initial_html = str(solution.get("response", ""))
-            session = _new_session(solution, cookies)
+            session = _new_session(solution, _session_cookies(session))
         else:
             initial_html = initial.text
     except requests.RequestException as exc:
@@ -754,15 +873,15 @@ def scene_from_url(url: str) -> ScrapedScene:
         log.error(f"[fc2madb.py] FAILURE TYPE=unsupported_url  URL={url}")
         return {}
 
-    cookies = _load_cookies()
-    if not cookies.get("fc2cmadb-session") or not cookies.get("XSRF-TOKEN"):
+    email, password = _credentials()
+    if not email or not password:
         log.error(
-            f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  missing session cookies. "
-            f"Put a browser cookie export in {COOKIE_FILE}."
+            f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  missing credentials. "
+            "Set fc2cmadb_email and fc2cmadb_password in config.ini."
         )
         return {}
     with _rate_state_lock():
-        return _scene_from_url_locked(url, cookies)
+        return _scene_from_url_locked(url, email, password)
 
 
 if __name__ == "__main__":
