@@ -1,9 +1,0 @@
-id: fc2ppvdb-custom
-name: fc2ppvdb-custom
-metadata: {}
-version: 3c1f701
-date: "2025-01-25 18:29:12"
-requires: []
-# source_repository: https://stashapp.github.io/CommunityScrapers/stable/index.yml
-files:
-- fc2ppvdb-custom.yml
