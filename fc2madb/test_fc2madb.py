@@ -112,6 +112,7 @@ class ScraperTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.rate_file = str(Path(self.tempdir.name) / "rate_state.json")
+        self.session_file = str(Path(self.tempdir.name) / "auth_session.json")
         self.cookies = {"fc2cmadb-session": "session", "XSRF-TOKEN": "token"}
 
     def tearDown(self):
@@ -120,6 +121,8 @@ class ScraperTests(unittest.TestCase):
     def run_scrape(self, responses):
         session = FakeSession(responses)
         with patch.object(fc2madb, "RATE_LIMIT_STATE_FILE", self.rate_file), patch.object(
+            fc2madb, "AUTH_SESSION_FILE", self.session_file
+        ), patch.object(
             fc2madb, "_credentials", return_value=("email", "password")
         ), patch.object(fc2madb, "_login_with_credentials", return_value=session), patch.object(
             fc2madb.requests, "Session", return_value=session
@@ -173,6 +176,19 @@ class ScraperTests(unittest.TestCase):
         self.assertNotIn("X-Inertia", session.headers)
         self.assertNotIn("X-XSRF-TOKEN", session.headers)
         self.assertEqual(command.call_args_list[-1].args[0]["cmd"], "sessions.destroy")
+
+    def test_session_persistence_is_private_and_round_trips(self):
+        session = requests.Session()
+        session.headers["User-Agent"] = "saved-agent"
+        session.cookies.set(
+            "fc2cmadb-session", "session-secret", domain="fc2cmadb.com", path="/"
+        )
+        with patch.object(fc2madb, "AUTH_SESSION_FILE", self.session_file):
+            self.assertTrue(fc2madb._save_session(session))
+            self.assertEqual(Path(self.session_file).stat().st_mode & 0o777, 0o600)
+            saved = fc2madb._load_saved_session()
+        self.assertEqual(saved["user_agent"], "saved-agent")
+        self.assertEqual(saved["cookies"]["fc2cmadb-session"], "session-secret")
 
     def test_login_cookie_canonicalization_prefers_response_values(self):
         session = requests.Session()
@@ -298,16 +314,126 @@ class ScraperTests(unittest.TestCase):
         self.assertEqual(result, {"tags": [{"name": "FC2MADB 404"}]})
         self.assertEqual(len(session.calls), 1)
 
-    def test_unauthenticated_404_does_not_tag_scene(self):
-        response = FakeResponse(status_code=404, text=initial_html(user=False, status=404))
-        result, _ = self.run_scrape([response])
+    def test_failed_credential_login_does_not_repeat_turnstile(self):
+        first = FakeResponse(status_code=404, text=initial_html(user=False, status=404))
+        result, session = self.run_scrape([first])
         self.assertEqual(result, {})
+        self.assertEqual(len(session.calls), 1)
+
+    def test_saved_session_can_be_reused_without_credentials(self):
+        Path(self.session_file).write_text(
+            json.dumps({"version": fc2madb._AUTH_SESSION_VERSION, "cookies": self.cookies}),
+            encoding="utf-8",
+        )
+        session = FakeSession(
+            [
+                FakeResponse(text=initial_html()),
+                FakeResponse(payload={"component": "Articles/Show", "props": {"actresses": []}}),
+            ]
+        )
+        with patch.object(fc2madb, "RATE_LIMIT_STATE_FILE", self.rate_file), patch.object(
+            fc2madb, "AUTH_SESSION_FILE", self.session_file
+        ), patch.object(fc2madb, "_credentials", return_value=("", "")), patch.object(
+            fc2madb, "_new_session", return_value=session
+        ), patch.object(
+            fc2madb, "_login_with_credentials", side_effect=AssertionError("login should be skipped")
+        ):
+            result = fc2madb.scene_from_url(URL)
+        self.assertEqual(result["performers"], [])
+
+    def test_saved_authenticated_session_skips_credential_login(self):
+        Path(self.session_file).write_text(
+            json.dumps(
+                {
+                    "version": fc2madb._AUTH_SESSION_VERSION,
+                    "user_agent": "saved-agent",
+                    "cookies": self.cookies,
+                }
+            ),
+            encoding="utf-8",
+        )
+        session = FakeSession(
+            [
+                FakeResponse(text=initial_html()),
+                FakeResponse(payload={"component": "Articles/Show", "props": {"actresses": []}}),
+            ]
+        )
+        with patch.object(fc2madb, "RATE_LIMIT_STATE_FILE", self.rate_file), patch.object(
+            fc2madb, "AUTH_SESSION_FILE", self.session_file
+        ), patch.object(fc2madb, "_credentials", return_value=("email", "password")), patch.object(
+            fc2madb, "_new_session", return_value=session
+        ), patch.object(
+            fc2madb, "_login_with_credentials", side_effect=AssertionError("login should be skipped")
+        ):
+            result = fc2madb.scene_from_url(URL)
+        self.assertEqual(result["performers"], [])
+        self.assertEqual(len(session.calls), 2)
+
+    def test_expired_saved_session_logs_in_and_retries(self):
+        Path(self.session_file).write_text(
+            json.dumps(
+                {"version": fc2madb._AUTH_SESSION_VERSION, "cookies": self.cookies}
+            ),
+            encoding="utf-8",
+        )
+        reused = FakeSession(
+            [FakeResponse(status_code=302, text="", url=fc2madb.LOGIN_URL)]
+        )
+        authenticated = FakeSession(
+            [
+                FakeResponse(text=initial_html()),
+                FakeResponse(payload={"component": "Articles/Show", "props": {"actresses": []}}),
+            ]
+        )
+        with patch.object(fc2madb, "RATE_LIMIT_STATE_FILE", self.rate_file), patch.object(
+            fc2madb, "AUTH_SESSION_FILE", self.session_file
+        ), patch.object(fc2madb, "_credentials", return_value=("email", "password")), patch.object(
+            fc2madb, "_new_session", return_value=reused
+        ), patch.object(
+            fc2madb, "_login_with_credentials", return_value=authenticated
+        ) as login:
+            result = fc2madb.scene_from_url(URL)
+        self.assertEqual(result["performers"], [])
+        self.assertEqual(login.call_count, 1)
+        self.assertEqual(len(reused.calls), 1)
+        self.assertEqual(len(authenticated.calls), 2)
 
     def test_missing_article_is_transient_empty_result(self):
         result, _ = self.run_scrape(
             [FakeResponse(text=initial_html(article=False))]
         )
         self.assertEqual(result, {})
+
+    def test_missing_rate_headers_identifies_phase_and_source(self):
+        state = {
+            "version": 1,
+            "cooldown_until": 0.0,
+            "window_start": 0.0,
+            "limit": 3,
+            "remaining": 3,
+        }
+        response = FakeResponse()
+        response.headers = {}
+        with self.assertLogs(log, level="INFO") as captured:
+            fc2madb._record_response(
+                state,
+                response,
+                phase="article_initial",
+            )
+        output = "\n".join(captured.output)
+        self.assertIn("phase=article_initial", output)
+        self.assertIn("source=origin_response", output)
+        self.assertIn("status=200", output)
+        self.assertIn("reason=origin response omitted", output)
+
+        with self.assertLogs(log, level="INFO") as captured:
+            fc2madb._record_solution_response(
+                state, {}, phase="turnstile"
+            )
+        output = "\n".join(captured.output)
+        self.assertIn("phase=turnstile", output)
+        self.assertIn("source=flaresolverr_solution", output)
+        self.assertIn("reason=FlareSolverr did not forward", output)
 
     def test_zero_remaining_header_persists_30_second_cooldown(self):
         response = FakeResponse(
@@ -359,6 +485,25 @@ class ScraperTests(unittest.TestCase):
         state = json.loads(Path(self.rate_file).read_text())
         self.assertEqual(state["limit"], 3)
         self.assertEqual(state["remaining"], 1)
+
+    def test_flaresolverr_inertia_429_without_status_saves_cooldown(self):
+        solution = {
+            "response": initial_html(user=True, article=False, status=429),
+            "headers": {},
+        }
+        session = FakeSession([FakeResponse(status_code=403, text="Cloudflare 1005")])
+        with patch.object(fc2madb, "RATE_LIMIT_STATE_FILE", self.rate_file), patch.object(
+            fc2madb, "AUTH_SESSION_FILE", self.session_file
+        ), patch.object(
+            fc2madb, "_credentials", return_value=("email", "password")
+        ), patch.object(fc2madb, "_login_with_credentials", return_value=session), patch.object(
+            fc2madb.requests, "Session", return_value=session
+        ), patch.object(fc2madb, "_get_flaresolverr_solution", return_value=solution):
+            result = fc2madb.scene_from_url(URL)
+        self.assertEqual(result, {})
+        state = json.loads(Path(self.rate_file).read_text())
+        self.assertEqual(state["remaining"], 0)
+        self.assertGreaterEqual(state["cooldown_until"] - time.time(), 29)
 
     def test_flaresolverr_429_saves_cooldown(self):
         solution = {

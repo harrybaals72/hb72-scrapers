@@ -74,7 +74,7 @@ Use FlareSolverr as the browser/Turnstile solver, then perform the credential PO
 
 The previous cookie-based implementation loaded every record from `cookies.json`, including `remember_web_*`; it did not filter the jar down to only session and XSRF cookies. A live remember-only request confirmed that Laravel could use that cookie to issue a fresh session.
 
-That finding explains the old implementation but is not part of the credential-based runtime. The current scraper has no `_load_cookies()` function, does not read `cookies.json`, and does not accept browser-cookie environment overrides. It obtains only the temporary cookies required for the current scrape from FlareSolverr and the direct credential-login response.
+That finding explains the old implementation but is not part of the credential-based runtime. The current scraper has no `_load_cookies()` function, does not read `cookies.json`, and does not accept browser-cookie environment overrides. It uses only cookies obtained from its own FlareSolverr/credential flow, and may persist the canonicalized authenticated jar in its private `auth_session.json` for later reuse.
 
 ---
 
@@ -127,7 +127,7 @@ The live credential test returned HTTP 409 with `X-Inertia-Location: https://fc2
 
 The existing rate-limit investigation observed that a 429 response tells the receiving client to delete `remember_web_*`. That deletes the cookie from that client's cookie jar; it does not make manual browser export the only possible recovery path.
 
-The credential-based scraper holds the login cookies only in memory for the current scrape. If a 429 deletes `remember_web_*`, that scrape terminates and the persisted rate state enforces the existing 30-second safety cooldown. A later invocation creates a fresh remembered session from credentials; no browser cookie export is involved.
+The credential-based scraper keeps the active login cookies in memory and, after authenticated article props are proven, atomically refreshes its private `auth_session.json`. If a 429 deletes `remember_web_*`, that scrape terminates and the persisted rate state enforces the existing 30-second safety cooldown; the damaged session is not trusted until a later article response proves authentication again. A later invocation reuses the saved session when valid, otherwise creates a fresh remembered session from credentials; no browser cookie export is involved.
 
 The implementation retains the existing rate-limit lock/cooldown and never attempts credential login as an immediate retry after a 429.
 
@@ -143,10 +143,11 @@ For each scrape it:
 2. Creates a FlareSolverr session, warms `/login`, then uses the hash-navigation Turnstile flow.
 3. Records FlareSolverr-carried rate-limit headers, waits again when needed, and posts the credentials directly to fc2cmadb over HTTPS.
 4. Requires Laravel/Inertia's successful redirect response before scraping.
-5. Reuses that in-memory authenticated session for the article and deferred-performer requests, retaining the existing authenticated-props checks and 429 handling.
-6. Destroys the FlareSolverr session in a `finally` block.
+5. Reuses that authenticated session for the article and deferred-performer requests, retaining the existing authenticated-props checks and 429 handling.
+6. Saves canonicalized session cookies only after authenticated article props are proven, then destroys the temporary FlareSolverr session.
+7. Destroys the FlareSolverr session in a `finally` block.
 
-No credentials, returned token, or cookie values are persisted or logged. `config.ini` is Git-ignored and intentionally absent from the package manifest.
+Credentials and returned Turnstile tokens are never persisted or logged. The scraper-created cookie session is persisted only in ignored `auth_session.json`, atomically with mode `0600`; browser cookie exports and `cookies.json` are never read. `config.ini` is Git-ignored and intentionally absent from the package manifest.
 
 ### Operational cautions
 

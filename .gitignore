@@ -2,6 +2,7 @@
 fc2madb/cookies.json
 fc2madb/config.ini
 fc2madb/rate_state.json
+fc2madb/auth_session.json
 
 # Python bytecode.
 __pycache__/

@@ -44,6 +44,9 @@ TURNSTILE_TAB_COUNT = int(os.environ.get("FC2CMADB_TURNSTILE_TAB_COUNT", "8"))
 RATE_LIMIT_STATE_FILE = os.environ.get(
     "FC2CMADB_RATE_STATE_FILE", str(Path(__file__).with_name("rate_state.json"))
 )
+AUTH_SESSION_FILE = os.environ.get(
+    "FC2CMADB_AUTH_SESSION_FILE", str(Path(__file__).with_name("auth_session.json"))
+)
 ARTICLE_ID_RE = re.compile(r"(?<!\d)(\d{5,})(?!\d)")
 
 # py_common manages a local config.ini next to the scraper. Do not log these
@@ -187,6 +190,69 @@ def _new_session(
 def _session_cookies(session: requests.Session) -> dict[str, str]:
     """Return canonical current cookies for FlareSolverr recovery."""
     return _canonicalize_session_cookies(session)
+
+
+_AUTH_SESSION_VERSION = 1
+
+
+def _load_saved_session() -> dict[str, Any] | None:
+    """Load the scraper's own private authenticated session, if available."""
+    path = Path(AUTH_SESSION_FILE)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(raw, dict) or raw.get("version") != _AUTH_SESSION_VERSION:
+        return None
+    raw_cookies = raw.get("cookies")
+    if not isinstance(raw_cookies, dict):
+        return None
+    cookies = {
+        str(name): str(value)
+        for name, value in raw_cookies.items()
+        if isinstance(name, str) and isinstance(value, str) and value
+    }
+    if not cookies:
+        return None
+    user_agent = raw.get("user_agent")
+    return {
+        "cookies": cookies,
+        "user_agent": str(user_agent) if isinstance(user_agent, str) else "",
+    }
+
+
+def _save_session(session: requests.Session) -> bool:
+    """Atomically save this scraper-created session without logging values."""
+    cookies = _session_cookies(session)
+    if not cookies:
+        return False
+    path = Path(AUTH_SESSION_FILE)
+    payload = {
+        "version": _AUTH_SESSION_VERSION,
+        "user_agent": str(session.headers.get("User-Agent") or ""),
+        "cookies": cookies,
+    }
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+        os.chmod(temporary, 0o600)
+        temporary.replace(path)
+        os.chmod(path, 0o600)
+        return True
+    except OSError as exc:
+        log.warning(
+            f"[fc2madb.py] Auth session persistence failed "
+            f"error_type={type(exc).__name__}"
+        )
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        return False
 
 
 def _flaresolverr_command(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -343,6 +409,10 @@ def _wait_for_cooldown(state: dict[str, Any]) -> None:
 def _update_rate_state_from_headers(
     state: dict[str, Any],
     headers: dict[str, str],
+    *,
+    phase: str = "unknown",
+    source: str = "origin_response",
+    status: Any = None,
 ) -> dict[str, Any]:
     """Update rate-limit state from response headers.
 
@@ -378,9 +448,16 @@ def _update_rate_state_from_headers(
             )
 
     if not remaining_str:
+        header_names = ",".join(sorted(str(name).lower() for name in headers)) or "none"
+        reason = (
+            "FlareSolverr did not forward origin rate-limit headers"
+            if source == "flaresolverr_solution"
+            else "origin response omitted X-RateLimit-Remaining"
+        )
         log.info(
-            "[fc2madb.py] Rate-limit headers not present in response — "
-            "site may not be throttling this request"
+            f"[fc2madb.py] Rate-limit headers absent phase={phase} "
+            f"source={source} status={status if status is not None else 'unknown'} "
+            f"observed_headers={header_names} reason={reason}"
         )
         return state
 
@@ -457,34 +534,64 @@ def _force_rate_limit_cooldown(state: dict[str, Any]) -> None:
     state["window_start"] = now
 
 
-def _record_response(state: dict[str, Any], response: Any) -> None:
+def _record_response(
+    state: dict[str, Any], response: Any, *, phase: str = "unknown"
+) -> None:
     """Persist rate state immediately after every origin response."""
-    _update_rate_state_from_headers(state, dict(getattr(response, "headers", {})))
-    if getattr(response, "status_code", 0) == 429:
+    status = getattr(response, "status_code", None)
+    _update_rate_state_from_headers(
+        state,
+        dict(getattr(response, "headers", {})),
+        phase=phase,
+        source="origin_response",
+        status=status,
+    )
+    if status == 429:
         _force_rate_limit_cooldown(state)
+        log.info(
+            f"[fc2madb.py] Rate-limit cooldown forced phase={phase} "
+            f"status=429 cooldown={_ZERO_REMAINING_COOLDOWN_SECONDS}s"
+        )
     _save_rate_state(state)
 
 
 def _record_solution_response(
-    state: dict[str, Any], solution: dict[str, Any]
+    state: dict[str, Any], solution: dict[str, Any], *, phase: str = "unknown"
 ) -> int | None:
     """Persist headers/status carried by a FlareSolverr origin response.
 
     FlareSolverr versions do not consistently include the origin status in a
-    solution.  ``None`` preserves that uncertainty so the Inertia props can
-    provide the authoritative status when available.
+    solution. When absent, infer it from embedded Inertia props when possible;
+    ``None`` preserves uncertainty only when neither source provides status.
     """
     raw_status = solution.get("status")
     if raw_status is None:
         raw_status = solution.get("statusCode")
+    if raw_status is None:
+        # Some FlareSolverr versions omit status but include an Inertia error
+        # page whose props still identify a 429. Infer it before returning so
+        # the cooldown cannot be skipped.
+        response_props = _inertia_page_data(str(solution.get("response") or ""))
+        if isinstance(response_props, dict):
+            raw_status = response_props.get("status")
     try:
         status = int(raw_status) if raw_status is not None else None
     except (TypeError, ValueError):
         status = None
     headers = solution.get("headers") if isinstance(solution.get("headers"), dict) else {}
-    _update_rate_state_from_headers(state, headers)
+    _update_rate_state_from_headers(
+        state,
+        headers,
+        phase=phase,
+        source="flaresolverr_solution",
+        status=status,
+    )
     if status == 429:
         _force_rate_limit_cooldown(state)
+        log.info(
+            f"[fc2madb.py] Rate-limit cooldown forced phase={phase} "
+            f"status=429 cooldown={_ZERO_REMAINING_COOLDOWN_SECONDS}s"
+        )
     _save_rate_state(state)
     return status
 
@@ -578,7 +685,9 @@ def _login_with_credentials(
         if not isinstance(warm_solution, dict):
             log.error("[fc2madb.py] FAILURE TYPE=login  FlareSolverr did not render the login page")
             return None
-        warm_status = _record_solution_response(rate_state, warm_solution)
+        warm_status = _record_solution_response(
+            rate_state, warm_solution, phase="login_page"
+        )
         if warm_status == 429:
             log.error("[fc2madb.py] FAILURE TYPE=http_429  login page rate limit exceeded")
             return None
@@ -604,7 +713,9 @@ def _login_with_credentials(
         if not isinstance(solution, dict):
             log.error("[fc2madb.py] FAILURE TYPE=login  FlareSolverr did not solve Turnstile")
             return None
-        solved_status = _record_solution_response(rate_state, solution)
+        solved_status = _record_solution_response(
+            rate_state, solution, phase="turnstile"
+        )
         if solved_status == 429:
             log.error("[fc2madb.py] FAILURE TYPE=http_429  Turnstile request rate limit exceeded")
             return None
@@ -652,7 +763,7 @@ def _login_with_credentials(
         except requests.RequestException as exc:
             log.error(f"[fc2madb.py] FAILURE TYPE=login  credential request failed: {exc}")
             return None
-        _record_response(rate_state, response)
+        _record_response(rate_state, response, phase="credential_post")
         response_cookie_summary = _cookie_summary(getattr(response, "cookies", ()))
         _canonicalize_session_cookies(
             session, getattr(response, "cookies", ())
@@ -754,12 +865,36 @@ def _duration_seconds(value: Any) -> int | None:
     return None
 
 
-def _scene_from_url_locked(url: str, email: str, password: str) -> ScrapedScene:
+def _scene_from_url_locked(
+    url: str, email: str, password: str, *, force_login: bool = False
+) -> ScrapedScene:
     rate_state = _load_rate_state()
     _wait_for_cooldown(rate_state)
-    session = _login_with_credentials(rate_state, email, password)
-    if session is None:
-        return {}
+
+    saved = None if force_login else _load_saved_session()
+    if saved:
+        session = _new_session(
+            {"userAgent": saved.get("user_agent", "")}, saved["cookies"]
+        )
+        log.info(
+            "[fc2madb.py] AUTH stage=session_reuse outcome=loaded "
+            f"cookies=({_cookie_summary(session.cookies)})"
+        )
+    else:
+        if not email or not password:
+            log.error(
+                "[fc2madb.py] FAILURE TYPE=auth "
+                "saved session is not authenticated and credentials are missing"
+            )
+            return {}
+        log.info(
+            "[fc2madb.py] AUTH stage=session_reuse outcome=credential_login "
+            f"reason={'forced' if force_login else 'no_saved_session'}"
+        )
+        session = _login_with_credentials(rate_state, email, password)
+        if session is None:
+            return {}
+
     # A successful login commonly leaves one request in the throttle window.
     # Wait before the article GET so login and scraping cannot trigger a 429.
     _wait_for_cooldown(rate_state)
@@ -770,11 +905,24 @@ def _scene_from_url_locked(url: str, email: str, password: str) -> ScrapedScene:
     initial_content_type = ""
     initial_response_path = ""
 
+    def retry_with_login(reason: str) -> ScrapedScene:
+        # A credential login was already attempted when no saved session was
+        # available. Do not launch a duplicate Turnstile flow in that case.
+        if force_login or saved is None:
+            return {}
+        log.info(
+            f"[fc2madb.py] AUTH stage=session_reuse outcome=expired "
+            f"action=credential_login reason={reason}"
+        )
+        return _scene_from_url_locked(
+            url, email, password, force_login=True
+        )
+
     try:
         # Login-only X-Inertia/XSRF headers are deliberately scoped to the
         # credential POST, so this remains a normal browser document GET.
         initial = session.get(url, timeout=REQUEST_TIMEOUT)
-        _record_response(rate_state, initial)
+        _record_response(rate_state, initial, phase="article_initial")
         initial_status = initial.status_code
         initial_content_type = str(initial.headers.get("Content-Type") or "")
         initial_response_path = urlparse(str(initial.url)).path
@@ -788,7 +936,7 @@ def _scene_from_url_locked(url: str, email: str, password: str) -> ScrapedScene:
             return {}
         if _login_page(initial.text, initial.url):
             log.error(f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  login prompt in direct fetch")
-            return {}
+            return retry_with_login("direct_login_prompt")
         if initial_status == 403 and "1005" in initial.text:
             solution = _get_flaresolverr_solution(url, _session_cookies(session))
             if not solution:
@@ -797,7 +945,9 @@ def _scene_from_url_locked(url: str, email: str, password: str) -> ScrapedScene:
                     "ASN block and no FlareSolverr fallback"
                 )
                 return {}
-            initial_status = _record_solution_response(rate_state, solution)
+            initial_status = _record_solution_response(
+                rate_state, solution, phase="article_cloudflare"
+            )
             solution_headers = solution.get("headers")
             if isinstance(solution_headers, dict):
                 initial_content_type = str(
@@ -820,7 +970,7 @@ def _scene_from_url_locked(url: str, email: str, password: str) -> ScrapedScene:
 
     if _login_page(initial_html):
         log.error(f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  login prompt in initial response")
-        return {}
+        return retry_with_login("initial_login_prompt")
 
     initial_props = _inertia_page_data(initial_html)
     if initial_props is None and initial_status in (200, None):
@@ -843,10 +993,10 @@ def _scene_from_url_locked(url: str, email: str, password: str) -> ScrapedScene:
         }
         try:
             info_response = session.get(url, timeout=REQUEST_TIMEOUT, headers=headers)
-            _record_response(rate_state, info_response)
+            _record_response(rate_state, info_response, phase="article_fallback")
             if _login_page(info_response.text, info_response.url):
                 log.error(f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  Inertia GET redirected to login")
-                return {}
+                return retry_with_login("fallback_login_prompt")
             if info_response.status_code == 429:
                 log.error(f"[fc2madb.py] FAILURE TYPE=http_429  URL={url}  rate limit exceeded")
                 return {}
@@ -872,6 +1022,17 @@ def _scene_from_url_locked(url: str, email: str, password: str) -> ScrapedScene:
             initial_status = int(raw_status) if raw_status is not None else 200
         except (TypeError, ValueError):
             initial_status = 200
+        if initial_status == 429 and solution is not None:
+            # FlareSolverr may omit status while forwarding an error page whose
+            # Inertia props identify the origin response as a 429.
+            _force_rate_limit_cooldown(rate_state)
+            _save_rate_state(rate_state)
+            log.info(
+                "[fc2madb.py] Rate-limit cooldown forced "
+                "phase=article_cloudflare status=429 "
+                f"cooldown={_ZERO_REMAINING_COOLDOWN_SECONDS}s "
+                "reason=inferred_from_inertia_props"
+            )
 
     # Auth is deliberately checked before interpreting a 404. An error page
     # without auth data cannot prove that the credential session is logged in.
@@ -889,7 +1050,12 @@ def _scene_from_url_locked(url: str, email: str, password: str) -> ScrapedScene:
             f"content_type={initial_content_type or '(none)'}, "
             f"session_cookies=({_cookie_summary(session.cookies)})"
         )
-        return {}
+        return retry_with_login("article_props_auth_missing")
+
+    # Auth is proven by the article response, so persist any rotated cookies
+    # only after this check. This prevents an unauthenticated response from
+    # overwriting the last known-good session.
+    _save_session(session)
 
     if initial_status == 404:
         log.error(
@@ -927,10 +1093,10 @@ def _scene_from_url_locked(url: str, email: str, password: str) -> ScrapedScene:
     }
     try:
         info_response = session.get(url, timeout=REQUEST_TIMEOUT, headers=inertia_headers)
-        _record_response(rate_state, info_response)
+        _record_response(rate_state, info_response, phase="article_deferred")
         if _login_page(info_response.text, info_response.url):
             log.error(f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  deferred GET redirected to login")
-            return {}
+            return retry_with_login("deferred_login_prompt")
         if info_response.status_code == 429:
             log.error(f"[fc2madb.py] FAILURE TYPE=http_429  URL={url}  rate limit exceeded")
             return {}
@@ -941,8 +1107,11 @@ def _scene_from_url_locked(url: str, email: str, password: str) -> ScrapedScene:
                 return {}
             inertia_headers["X-Inertia-Version"] = new_version
             retry = session.get(url, timeout=REQUEST_TIMEOUT, headers=inertia_headers)
-            _record_response(rate_state, retry)
-            if _login_page(retry.text, retry.url) or retry.status_code != 200:
+            _record_response(rate_state, retry, phase="article_deferred_retry")
+            if _login_page(retry.text, retry.url):
+                log.error(f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  deferred retry redirected to login")
+                return retry_with_login("deferred_retry_login_prompt")
+            if retry.status_code != 200:
                 log.error(f"[fc2madb.py] FAILURE TYPE=http_{retry.status_code}  URL={url}  deferred retry failed")
                 return {}
             info_response = retry
@@ -1023,11 +1192,16 @@ def scene_from_url(url: str) -> ScrapedScene:
     url = f"https://{SITE_HOST}/articles/{article_id}"
     email, password = _credentials()
     if not email or not password:
-        log.error(
-            f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  missing credentials. "
-            "Set fc2cmadb_email and fc2cmadb_password in config.ini."
+        if _load_saved_session() is None:
+            log.error(
+                f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  missing credentials. "
+                "Set fc2cmadb_email and fc2cmadb_password in config.ini."
+            )
+            return {}
+        log.info(
+            "[fc2madb.py] AUTH stage=session_reuse credentials=not_required "
+            "saved_session=available"
         )
-        return {}
     with _rate_state_lock():
         return _scene_from_url_locked(url, email, password)
 
