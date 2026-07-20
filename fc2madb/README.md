@@ -20,3 +20,5 @@ The scraper uses FlareSolverr at `http://9.9.9.200:8191/v1` by default to render
 Override the FlareSolverr endpoint with `FLARESOLVERR_URL`. Advanced deployment tuning is available through `FC2CMADB_TIMEOUT`, `FC2CMADB_FLARESOLVERR_TIMEOUT_MS`, `FC2CMADB_TURNSTILE_WIDGET_WAIT_SECONDS`, and `FC2CMADB_TURNSTILE_TAB_COUNT` (default: `8`).
 
 The existing cross-process rate-state lock and cooldown remain active for login and article requests. A 429 is terminal for that scrape and triggers the existing 30-second safety cooldown.
+
+Authentication diagnostics are logged as `AUTH stage=...` records. They report only response status, redirect path, and cookie-category counts; credentials, Turnstile/XSRF values, cookie values, and dynamic remember-cookie names are never logged. `mode=credentials browser_cookie_import=disabled` confirms that the active scraper is not using the former browser-cookie method.

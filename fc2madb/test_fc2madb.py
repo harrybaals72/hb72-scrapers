@@ -76,6 +76,9 @@ class FakeCookies:
     def __iter__(self):
         return iter(())
 
+    def clear(self):
+        self.values.clear()
+
 
 class FakeSession:
     def __init__(self, responses, post_responses=None):
@@ -166,8 +169,57 @@ class ScraperTests(unittest.TestCase):
                 "token": "test-turnstile-token",
             },
         )
-        self.assertEqual(session.headers["X-XSRF-TOKEN"], "encoded=token")
+        self.assertEqual(post_kwargs["headers"]["X-XSRF-TOKEN"], "encoded=token")
+        self.assertNotIn("X-Inertia", session.headers)
+        self.assertNotIn("X-XSRF-TOKEN", session.headers)
         self.assertEqual(command.call_args_list[-1].args[0]["cmd"], "sessions.destroy")
+
+    def test_login_cookie_canonicalization_prefers_response_values(self):
+        session = requests.Session()
+        session.cookies.set(
+            "fc2cmadb-session", "stale", domain=".fc2cmadb.com", path="/"
+        )
+        session.cookies.set(
+            "XSRF-TOKEN", "stale-xsrf", domain=".fc2cmadb.com", path="/"
+        )
+        response_cookies = requests.cookies.RequestsCookieJar()
+        response_cookies.set(
+            "fc2cmadb-session", "fresh", domain="fc2cmadb.com", path="/"
+        )
+        response_cookies.set(
+            "XSRF-TOKEN", "fresh-xsrf", domain="fc2cmadb.com", path="/"
+        )
+        for cookie in response_cookies:
+            session.cookies.set_cookie(cookie)
+
+        values = fc2madb._canonicalize_session_cookies(
+            session, response_cookies
+        )
+
+        self.assertEqual(values["fc2cmadb-session"], "fresh")
+        self.assertEqual(values["XSRF-TOKEN"], "fresh-xsrf")
+        matching = [
+            cookie
+            for cookie in session.cookies
+            if cookie.name in {"fc2cmadb-session", "XSRF-TOKEN"}
+        ]
+        self.assertEqual(len(matching), 2)
+        self.assertTrue(all(cookie.domain == fc2madb.SITE_HOST for cookie in matching))
+
+    def test_new_session_collapses_duplicate_solution_cookie_names(self):
+        solution = {
+            "cookies": [
+                {"name": "XSRF-TOKEN", "value": "stale", "domain": ".fc2cmadb.com"},
+                {"name": "XSRF-TOKEN", "value": "fresh", "domain": "fc2cmadb.com"},
+            ]
+        }
+        session = fc2madb._new_session(solution)
+        matching = [
+            cookie for cookie in session.cookies if cookie.name == "XSRF-TOKEN"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0].value, "fresh")
+        self.assertEqual(matching[0].domain, fc2madb.SITE_HOST)
 
     def test_login_success_rejects_redirect_back_to_login(self):
         self.assertFalse(
@@ -180,12 +232,49 @@ class ScraperTests(unittest.TestCase):
                 FakeResponse(status_code=302, headers={"Location": "/dashboard"})
             )
         )
+        self.assertFalse(
+            fc2madb._login_succeeded(
+                FakeResponse(
+                    status_code=409,
+                    headers={"X-Inertia-Location": "https://fc2cmadb.com.evil.example/"},
+                )
+            )
+        )
 
     def test_missing_credentials_never_contacts_login_services(self):
         with patch.object(fc2madb, "_credentials", return_value=("", "")), patch.object(
             fc2madb, "_login_with_credentials", side_effect=AssertionError("login should not run")
         ):
             self.assertEqual(fc2madb.scene_from_url(URL), {})
+
+    def test_supported_url_secrets_are_removed_before_logging(self):
+        supplied = (
+            "https://user:PASSWORD_SECRET@fc2cmadb.com/articles/4604611"
+            "?token=TOKEN_SECRET#COOKIE_SECRET"
+        )
+        with patch.object(fc2madb, "_credentials", return_value=("", "")), self.assertLogs(
+            log, level="ERROR"
+        ) as captured:
+            self.assertEqual(fc2madb.scene_from_url(supplied), {})
+        output = "\n".join(captured.output)
+        self.assertIn(URL, output)
+        self.assertNotIn("PASSWORD_SECRET", output)
+        self.assertNotIn("TOKEN_SECRET", output)
+        self.assertNotIn("COOKIE_SECRET", output)
+
+    def test_flaresolverr_error_logging_suppresses_endpoint_secrets(self):
+        endpoint = "http://user:PASSWORD_SECRET@9.9.9.200:8191/v1?token=TOKEN_SECRET"
+        with patch.object(fc2madb, "FLARESOLVERR_URL", endpoint), patch.object(
+            fc2madb.requests,
+            "post",
+            side_effect=requests.ConnectionError("COOKIE_SECRET"),
+        ), self.assertLogs(log, level="WARNING") as captured:
+            self.assertIsNone(fc2madb._flaresolverr_command({"cmd": "sessions.create"}))
+        output = "\n".join(captured.output)
+        self.assertIn("9.9.9.200:8191/v1", output)
+        self.assertNotIn("PASSWORD_SECRET", output)
+        self.assertNotIn("TOKEN_SECRET", output)
+        self.assertNotIn("COOKIE_SECRET", output)
 
     def test_normal_success_requires_two_origin_gets_and_keeps_title_in_details(self):
         deferred = {

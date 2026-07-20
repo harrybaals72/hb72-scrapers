@@ -70,21 +70,11 @@ In a live test, FlareSolverr `request.post` after obtaining a token navigated to
 
 Use FlareSolverr as the browser/Turnstile solver, then perform the credential POST with `requests`.
 
-### 5. The current scraper already loads `remember_web_*`
+### 5. Historical cookie-loader finding
 
-The previous report said the scraper loaded only `fc2cmadb-session` and `XSRF-TOKEN`. That is incorrect.
+The previous cookie-based implementation loaded every record from `cookies.json`, including `remember_web_*`; it did not filter the jar down to only session and XSRF cookies. A live remember-only request confirmed that Laravel could use that cookie to issue a fresh session.
 
-`_load_cookies()` in `fc2madb.py` iterates over every record in `cookies.json`, and `_new_session()` installs every loaded cookie. This includes `remember_web_*` and `ageVerified`. The explicit session/XSRF checks in `scene_from_url()` are prerequisites, not a filter on the other cookies.
-
-A live request with only the saved `remember_web_*` cookie returned `302 /dashboard` and issued fresh `fc2cmadb-session` and `XSRF-TOKEN` cookies. Therefore, the current persisted remember cookie can already re-establish an authenticated session without CAPTCHA.
-
-The current `cookies.json` metadata also does not match the old report's expiry descriptions:
-
-- `fc2cmadb-session` and `XSRF-TOKEN`: expired 2026-07-16 21:03 UTC
-- `remember_web_*`: expires 2027-08-20
-- `ageVerified`: expires 2026-08-14
-
-The file can still work because the remember cookie refreshes the expired session.
+That finding explains the old implementation but is not part of the credential-based runtime. The current scraper has no `_load_cookies()` function, does not read `cookies.json`, and does not accept browser-cookie environment overrides. It obtains only the temporary cookies required for the current scrape from FlareSolverr and the direct credential-login response.
 
 ---
 

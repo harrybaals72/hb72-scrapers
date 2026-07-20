@@ -70,7 +70,7 @@ The login page (`/login`, component `Auth/Login`) submits `email`, `password`, `
 
 FlareSolverr PR #1634 was merged into `master` and is included in official v3.5.0, including the running instance at `9.9.9.200:8191`. Because its selector check races the dynamically rendered input, the scraper warms a persistent FlareSolverr session, then calls `request.get` on a hash-only login URL with `tabs_till_verify: 8`. It uses the returned token, cookies, and user agent for a direct HTTPS Inertia credential POST; FlareSolverr `request.post` is not the login path.
 
-`fc2madb.py` reads `fc2cmadb_email` and `fc2cmadb_password` from its ignored `config.ini`, never reads a browser cookie export, and destroys the FlareSolverr session after the credential POST. It records the login responses in the existing rate-limit state, honors the resulting cooldown before article requests, and retains the existing authenticated-props and 429 checks.
+`fc2madb.py` reads `fc2cmadb_email` and `fc2cmadb_password` from its ignored `config.ini`, never reads a browser cookie export, and destroys the FlareSolverr session after the credential POST. Login-only Inertia/XSRF headers must be scoped to that POST rather than stored in `session.headers`. After the POST, collapse FlareSolverr domain cookies and fresh response cookies to one `fc2cmadb.com`/`/` identity per name, preferring response values; otherwise Requests can send both a stale domain cookie and a fresh host-only cookie and Laravel may select the stale session. It records the login responses in the existing rate-limit state, honors the resulting cooldown before article requests, and retains the authenticated-props and 429 checks.
 
 ### Rate-limit state: saved on EVERY server-reaching request
 
