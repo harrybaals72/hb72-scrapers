@@ -887,14 +887,14 @@ def _scene_from_url_locked(
                 "[fc2madb.py] FAILURE TYPE=auth "
                 "saved session is not authenticated and credentials are missing"
             )
-            return {}
+            return None
         log.info(
             "[fc2madb.py] AUTH stage=session_reuse outcome=credential_login "
             f"reason={'forced' if force_login else 'no_saved_session'}"
         )
         session = _login_with_credentials(rate_state, email, password)
         if session is None:
-            return {}
+            return None
 
     # A successful login commonly leaves one request in the throttle window.
     # Wait before the article GET so login and scraping cannot trigger a 429.
@@ -910,7 +910,7 @@ def _scene_from_url_locked(
         # A credential login was already attempted when no saved session was
         # available. Do not launch a duplicate Turnstile flow in that case.
         if force_login or saved is None:
-            return {}
+            return None
         log.info(
             f"[fc2madb.py] AUTH stage=session_reuse outcome=expired "
             f"action=credential_login reason={reason}"
@@ -934,7 +934,7 @@ def _scene_from_url_locked(
         )
         if initial_status == 429:
             log.error(f"[fc2madb.py] FAILURE TYPE=http_429  URL={url}  rate limit exceeded")
-            return {}
+            return None
         if _login_page(initial.text, initial.url):
             log.error(f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  login prompt in direct fetch")
             return retry_with_login("direct_login_prompt")
@@ -945,7 +945,7 @@ def _scene_from_url_locked(
                     f"[fc2madb.py] FAILURE TYPE=cloudflare  URL={url}  "
                     "ASN block and no FlareSolverr fallback"
                 )
-                return {}
+                return None
             initial_status = _record_solution_response(
                 rate_state, solution, phase="article_cloudflare"
             )
@@ -958,7 +958,7 @@ def _scene_from_url_locked(
                 )
             if initial_status == 429:
                 log.error(f"[fc2madb.py] FAILURE TYPE=http_429  URL={url}  rate limit exceeded")
-                return {}
+                return None
             initial_html = str(solution.get("response", ""))
             session = _new_session(solution, _session_cookies(session))
         else:
@@ -967,7 +967,7 @@ def _scene_from_url_locked(
         # A timeout or connection error may occur after the request reached
         # FC2MADB. Do not issue another origin request through FlareSolverr.
         log.error(f"[fc2madb.py] FAILURE TYPE=unreachable  URL={url}  {exc}")
-        return {}
+        return None
 
     if _login_page(initial_html):
         log.error(f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  login prompt in initial response")
@@ -1000,7 +1000,7 @@ def _scene_from_url_locked(
                 return retry_with_login("fallback_login_prompt")
             if info_response.status_code == 429:
                 log.error(f"[fc2madb.py] FAILURE TYPE=http_429  URL={url}  rate limit exceeded")
-                return {}
+                return None
             try:
                 payload = info_response.json()
             except ValueError as exc:
@@ -1013,7 +1013,7 @@ def _scene_from_url_locked(
                 return {}
         except requests.RequestException as exc:
             log.error(f"[fc2madb.py] FAILURE TYPE=unreachable  URL={url}  {exc}")
-            return {}
+            return None
 
     # FlareSolverr may omit the origin status. In that case, use the
     # authenticated Inertia props (especially props.status for error pages).
@@ -1069,7 +1069,10 @@ def _scene_from_url_locked(
             f"[fc2madb.py] FAILURE TYPE=http_{initial_status}  URL={url}  "
             f"{_error_message(initial_props, initial_status)}"
         )
-        return {}
+        # 429 and other server errors are transient — return None so Stash
+        # continues to other Identify sources instead of treating the empty
+        # result as a successful scrape.
+        return None if initial_status in (429, 403, 500, 502, 503, 504) else {}
 
     article = initial_props.get("article")
     if not isinstance(article, dict):
@@ -1100,12 +1103,12 @@ def _scene_from_url_locked(
             return retry_with_login("deferred_login_prompt")
         if info_response.status_code == 429:
             log.error(f"[fc2madb.py] FAILURE TYPE=http_429  URL={url}  rate limit exceeded")
-            return {}
+            return None
         if info_response.status_code == 409:
             new_version = _inertia_version(info_response.text)
             if not new_version or new_version == version:
                 log.error(f"[fc2madb.py] FAILURE TYPE=http_409  URL={url}  version mismatch")
-                return {}
+                return None
             inertia_headers["X-Inertia-Version"] = new_version
             retry = session.get(url, timeout=REQUEST_TIMEOUT, headers=inertia_headers)
             _record_response(rate_state, retry, phase="article_deferred_retry")
@@ -1114,18 +1117,18 @@ def _scene_from_url_locked(
                 return retry_with_login("deferred_retry_login_prompt")
             if retry.status_code != 200:
                 log.error(f"[fc2madb.py] FAILURE TYPE=http_{retry.status_code}  URL={url}  deferred retry failed")
-                return {}
+                return None
             info_response = retry
         if info_response.status_code != 200:
             log.error(
                 f"[fc2madb.py] FAILURE TYPE=http_{info_response.status_code}  URL={url}  "
                 "deferred actresses request failed"
             )
-            return {}
+            return None
         payload = info_response.json()
     except (requests.RequestException, ValueError) as exc:
         log.error(f"[fc2madb.py] FAILURE TYPE=performers  URL={url}  {exc}")
-        return {}
+        return None
 
     if not isinstance(payload, dict) or payload.get("component") != "Articles/Show":
         log.error(f"[fc2madb.py] FAILURE TYPE=parse_error  URL={url}  unexpected Inertia component")
@@ -1198,7 +1201,7 @@ def scene_from_url(url: str) -> ScrapedScene:
                 f"[fc2madb.py] FAILURE TYPE=auth  URL={url}  missing credentials. "
                 "Set fc2cmadb_email and fc2cmadb_password in config.ini."
             )
-            return {}
+            return None
         log.info(
             "[fc2madb.py] AUTH stage=session_reuse credentials=not_required "
             "saved_session=available"

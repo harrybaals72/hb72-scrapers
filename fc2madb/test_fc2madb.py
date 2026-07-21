@@ -303,7 +303,7 @@ class ScraperTests(unittest.TestCase):
         with patch.object(fc2madb, "_credentials", return_value=("", "")), patch.object(
             fc2madb, "_login_with_credentials", side_effect=AssertionError("login should not run")
         ):
-            self.assertEqual(fc2madb.scene_from_url(URL), {})
+            self.assertIsNone(fc2madb.scene_from_url(URL))
 
     def test_supported_url_secrets_are_removed_before_logging(self):
         supplied = (
@@ -313,7 +313,7 @@ class ScraperTests(unittest.TestCase):
         with patch.object(fc2madb, "_credentials", return_value=("", "")), self.assertLogs(
             log, level="ERROR"
         ) as captured:
-            self.assertEqual(fc2madb.scene_from_url(supplied), {})
+            self.assertIsNone(fc2madb.scene_from_url(supplied))
         output = "\n".join(captured.output)
         self.assertIn(URL, output)
         self.assertNotIn("PASSWORD_SECRET", output)
@@ -359,7 +359,7 @@ class ScraperTests(unittest.TestCase):
     def test_failed_credential_login_does_not_repeat_turnstile(self):
         first = FakeResponse(status_code=404, text=initial_html(user=False, status=404))
         result, session = self.run_scrape([first])
-        self.assertEqual(result, {})
+        self.assertIsNone(result)
         self.assertEqual(len(session.calls), 1)
 
     def test_saved_session_can_be_reused_without_credentials(self):
@@ -496,7 +496,7 @@ class ScraperTests(unittest.TestCase):
         result, session = self.run_scrape(
             [FakeResponse(text=initial_html()), deferred_429]
         )
-        self.assertEqual(result, {})
+        self.assertIsNone(result)
         self.assertEqual(len(session.calls), 2)
         state = json.loads(Path(self.rate_file).read_text())
         self.assertEqual(state["remaining"], 0)
@@ -542,7 +542,7 @@ class ScraperTests(unittest.TestCase):
             fc2madb.requests, "Session", return_value=session
         ), patch.object(fc2madb, "_get_flaresolverr_solution", return_value=solution):
             result = fc2madb.scene_from_url(URL)
-        self.assertEqual(result, {})
+        self.assertIsNone(result)
         state = json.loads(Path(self.rate_file).read_text())
         self.assertEqual(state["remaining"], 0)
         self.assertGreaterEqual(state["cooldown_until"] - time.time(), 29)
@@ -562,7 +562,7 @@ class ScraperTests(unittest.TestCase):
             fc2madb, "_get_flaresolverr_solution", return_value=solution
         ):
             result = fc2madb.scene_from_url(URL)
-        self.assertEqual(result, {})
+        self.assertIsNone(result)
         state = json.loads(Path(self.rate_file).read_text())
         self.assertEqual(state["remaining"], 0)
         cooldown = state["cooldown_until"] - time.time()
@@ -572,7 +572,7 @@ class ScraperTests(unittest.TestCase):
 
     def test_direct_request_exception_does_not_invoke_flaresolverr(self):
         result, session = self.run_scrape([requests.ReadTimeout("read timed out")])
-        self.assertEqual(result, {})
+        self.assertIsNone(result)
         self.assertEqual(len(session.calls), 1)
 
     def test_empty_actresses_list_is_a_success(self):

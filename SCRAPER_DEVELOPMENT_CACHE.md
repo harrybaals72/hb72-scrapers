@@ -40,7 +40,7 @@ When a scraper cannot return a complete scene, distinguish **terminal** from **t
 
 **Terminal** (e.g. 404 — URL will never resolve): return `{"tags": [{"name": "FC2MADB 404"}]}` with the sentinel tag and **no** `code`, `details`, or `urls` metadata. The tag persists to indicate the URL is permanently unresolvable.
 
-**Transient** (e.g. 429, auth expiry, cloudflare, network error — may succeed on retry): return `{}` (empty dict). No metadata or tags should persist from a failed scrape — the user can retry and a subsequent successful scrape will populate the scene cleanly.
+**Transient** (e.g. 429, auth expiry, cloudflare, network error — may succeed on retry): return `null` (JSON null).  An empty object `{}` decodes as a valid empty `ScrapedScene`; the Identify task treats it as a successful scrape with no changes needed, logging "Nothing to set", and stops trying other sources.  Returning `null` causes Stash to treat the scrape as having no result at all, allowing the Identify task to continue to other sources.  The user can retry and a subsequent successful scrape will populate the scene cleanly.
 
 For all failures, log the reason with structured format (e.g. `FAILURE TYPE=<type>  URL=<url>`) for monitoring. The Identify task sees nothing for transient failures (no result to apply), so retries are not polluted by stale sentinel tags.
 
@@ -48,7 +48,7 @@ For the Identify task, pre-create the sentinel tag for terminal-only failures so
 
 ### Auth detection via Inertia page data
 
-The site embeds `auth.user` in the initial HTML page data (inside `<script data-page="app">`). When cookies are expired or invalid, `auth.user` is `null`. The scraper checks this after extracting the Inertia props — if `auth.user` is not a dict, the user is not logged in and the scraper returns `{}` with an error telling them to re-export cookies.
+The site embeds `auth.user` in the initial HTML page data (inside `<script data-page="app">`). When cookies are expired or invalid, `auth.user` is `null`. The scraper checks this after extracting the Inertia props — if `auth.user` is not a dict, the user is not logged in and the scraper returns `null` (JSON null) with an error, allowing the Identify task to continue to other sources.
 
 This check happens BEFORE the Inertia JSON GET for actresses, so no fallback occurs for an unauthenticated session. The auth check covers both the initial-HTML path (props from HTML) and the Inertia JSON GET fallback (full page data from the fallback request).
 
